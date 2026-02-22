@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Arduino / build
+*.tmp
+*.bak
+
+# PlatformIO (si tu l'utilises)
+.pio/
+.vscode/
+
+# Node / web (si jamais tu as ça)
+node_modules/
+
+# Logs
+*.log
+
+# Secrets (si tu en as)
+*.secret
+*.key

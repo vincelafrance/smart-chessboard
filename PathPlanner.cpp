@@ -111,6 +111,12 @@ static inline void markMagPickDrop(Waypoint *wps, uint8_t n, uint8_t pickIdx, ui
   if(pickIdx < n) wps[pickIdx].mag = 1;
   if(dropIdx < n) wps[dropIdx].mag = 0;
 }
+static inline void appendPostDropNeighbor(Waypoint *wps, uint8_t &n, uint8_t tf, uint8_t tr){
+  (void)wps;
+  (void)n;
+  (void)tf;
+  (void)tr;
+}
 static inline void squareInternalPoint(uint8_t f0, uint8_t r1, float uOffset, float vOffset, long &xAbs, long &yAbs) {
   float u = (float)f0 + clampf(uOffset, 0.15f, 0.85f);
   float v = (float)(r1 - 1) + clampf(vOffset, 0.15f, 0.85f);
@@ -151,6 +157,36 @@ void abortPath() {
   g_wpIndex = 0;
   g_autoMagnetPath = false;
   portEXIT_CRITICAL(&gMux);
+}
+
+void planSquareMoveDirect(uint8_t ff, uint8_t fr, uint8_t tf, uint8_t tr) {
+  if (ff == tf && fr == tr) return;
+
+  long fx, fy, tx, ty;
+  squareCenterSteps(ff, fr, fx, fy);
+  squareCenterSteps(tf, tr, tx, ty);
+
+  Waypoint wps[2];
+  uint8_t n = 0;
+  wps[n++] = { fx, fy, -1 };
+  wps[n++] = { tx, ty, -1 };
+
+  long xMin,xMax,yMin,yMax;
+  getXLimits(xMin,xMax);
+  getYLimits(yMin,yMax);
+  for (uint8_t i=0;i<n;i++){
+    wps[i].x = clampl(wps[i].x, xMin + EDGE_STOP_DIST, xMax - EDGE_STOP_DIST);
+    wps[i].y = clampl(wps[i].y, yMin + EDGE_STOP_DIST, yMax - EDGE_STOP_DIST);
+  }
+
+  markMagPickDrop(wps, n, 0, (uint8_t)(n-1));
+  appendPostDropNeighbor(wps, n, tf, tr);
+  beginMoveSeq(wps, n);
+
+  Serial.print("[PATH] DIRECT center ");
+  Serial.print((char)('a' + ff)); Serial.print(fr);
+  Serial.print(" -> ");
+  Serial.print((char)('a' + tf)); Serial.println(tr);
 }
 
 static inline void planWiggleSameSquare(uint8_t ff, uint8_t fr) {
@@ -288,7 +324,9 @@ if (fr == tr && ff == 4 && (fr == 1 || fr == 8) && (int)abs((int)tf - (int)ff) =
     wps[n++] = { fromEntryX, fromEntryY , -1 };
     wps[n++] = { fx, fy , -1 };
     wps[n++] = { tx, ty , -1 };
-    beginMoveSeq(wps, n);
+      markMagPickDrop(wps, n, 1, (uint8_t)(n-1));
+      appendPostDropNeighbor(wps, n, tf, tr);
+      beginMoveSeq(wps, n);
 
     Serial.print("[PATH] ADJ center->center ");
     Serial.print((char)('a' + ff)); Serial.print(fr);
@@ -298,30 +336,29 @@ if (fr == tr && ff == 4 && (fr == 1 || fr == 8) && (int)abs((int)tf - (int)ff) =
   }
 
 
-  // ===== Diagonal moves (bishop / diagonal queen / king one-step already handled) =====
-  // For true diagonal travel (|df| == |dr|), follow the centers of each intermediate square
-  // so the magnet visually traces the diagonal instead of using turn-line intersections.
+  // ===== Diagonal moves (bishop / diagonal queen / king) =====
+  // Follow centers of each intermediate diagonal square (e.g., f1->c4: e2,d3).
   {
     int df = (int)tf - (int)ff;
     int dr = (int)tr - (int)fr;
     int adf = abs(df);
     int adr = abs(dr);
-    if (adf >= 2 && adf == adr) {
-      // For long diagonal travel, move in ONE straight segment from center->center
-      // (plus entry waypoint). This keeps both motors active and avoids the
-      // "stair-step" look caused by stopping at each intermediate square.
+    if (adf == adr && adf > 0) {
       Waypoint wps[MAX_WAYPOINTS];
       uint8_t n = 0;
 
-      // Entry -> center of from -> center of destination
-      wps[n++] = { fromEntryX, fromEntryY , -1 };
-      wps[n++] = { fx, fy , -1 };
+      int stepF = (df > 0) ? 1 : -1;
+      int stepR = (dr > 0) ? 1 : -1;
 
-      long tx, ty;
-      squareCenterSteps(tf, tr, tx, ty);
-      wps[n++] = { tx, ty , -1 };
+      long sx, sy;
+      squareCenterSteps(ff, fr, sx, sy);
+      wps[n++] = { sx, sy, -1 };
 
-      // Clamp + magnet pick/drop
+      for (int i = 1; i <= adf && n < MAX_WAYPOINTS; i++) {
+        squareCenterSteps(ff + i * stepF, fr + i * stepR, sx, sy);
+        wps[n++] = { sx, sy, -1 };
+      }
+
       long xMin,xMax,yMin,yMax;
       getXLimits(xMin,xMax);
       getYLimits(yMin,yMax);
@@ -331,10 +368,11 @@ if (fr == tr && ff == 4 && (fr == 1 || fr == 8) && (int)abs((int)tf - (int)ff) =
         wps[i].y = clampl(wps[i].y, yMin + EDGE_STOP_DIST, yMax - EDGE_STOP_DIST);
       }
 
-      markMagPickDrop(wps, n, 1, (uint8_t)(n-1));
+      markMagPickDrop(wps, n, 0, (uint8_t)(n-1));
+      appendPostDropNeighbor(wps, n, tf, tr);
       beginMoveSeq(wps, n);
 
-      Serial.print("[PATH] DIAG straight ");
+      Serial.print("[PATH] DIAG centers ");
       Serial.print((char)('a' + ff)); Serial.print(fr);
       Serial.print(" -> ");
       Serial.print((char)('a' + tf)); Serial.println(tr);
@@ -432,6 +470,7 @@ if (fr == tr && ff == 4 && (fr == 1 || fr == 8) && (int)abs((int)tf - (int)ff) =
   }
 
   markMagPickDrop(wps, n, 1, (uint8_t)(n-1));
+  appendPostDropNeighbor(wps, n, tf, tr);
 
   beginMoveSeq(wps, n);
 

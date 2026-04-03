@@ -3,6 +3,7 @@
 #include "Utils.h"
 #include "Magnet.h"
 #include "PathPlanner.h"
+#include "DriversUART.h"
 
 static TaskHandle_t stepTaskHandle = nullptr;
 
@@ -118,15 +119,23 @@ static void stepTask(void *param) {
       const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
       const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);
 
-      if (!yDone) {
-        vx_t = 0.0f;
-        vy_t = clampf(RECENTER_KP * (float)ey, -vCap, +vCap);
-        if (fabs(vy_t) > 0.0f && fabs(vy_t) < RECENTER_MIN_VXY) vy_t = (vy_t > 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
-        settleStartMs = 0;
-      } else if (!xDone) {
-        vy_t = 0.0f;
-        vx_t = clampf(RECENTER_KP * (float)ex, -vCap, +vCap);
-        if (fabs(vx_t) > 0.0f && fabs(vx_t) < RECENTER_MIN_VXY) vx_t = (vx_t > 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
+      if (!xDone || !yDone) {
+        if (!xDone && !yDone) {
+          vCap *= 0.7f;
+        }
+        float vx_raw = RECENTER_KP * (float)ex;
+        float vy_raw = RECENTER_KP * (float)ey;
+
+        float maxAbs = fmaxf(fabsf(vx_raw), fabsf(vy_raw));
+        float scale = 1.0f;
+        if (maxAbs > vCap) scale = vCap / maxAbs;
+
+        vx_t = vx_raw * scale;
+        vy_t = vy_raw * scale;
+
+        if (!xDone && fabsf(vx_t) < RECENTER_MIN_VXY) vx_t = (ex >= 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
+        if (!yDone && fabsf(vy_t) < RECENTER_MIN_VXY) vy_t = (ey >= 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
+
         settleStartMs = 0;
       } else {
         if (settleStartMs == 0) settleStartMs = nowMs;
@@ -284,13 +293,20 @@ if (autoMag) {
     vA_cur = approachf(vA_cur, vA_t, maxDv);
     vB_cur = approachf(vB_cur, vB_t, maxDv);
 
-    uint32_t pA = speedToPeriodUs(vA_cur);
-    uint32_t pB = speedToPeriodUs(vB_cur);
+    uint8_t ms = getDriversUARTMicrosteps();
+    if (ms == 0) ms = 8;
+    const float motorScale = (float)ms / 8.0f;
+
+    uint32_t pA = speedToPeriodUs(vA_cur * motorScale);
+    uint32_t pB = speedToPeriodUs(vB_cur * motorScale);
 
     int8_t dirA = (vA_cur > 1.0f) ? +1 : (vA_cur < -1.0f) ? -1 : 0;
     int8_t dirB = (vB_cur > 1.0f) ? +1 : (vB_cur < -1.0f) ? -1 : 0;
 
     bool wantsMove = (pA != 0 || pB != 0) || recenter || calibY || calibX || pathActive;
+    bool precisionMode = recenter || calibY || calibX || pathActive;
+
+    serviceDriversUART(vA_cur, vB_cur, wantsMove, precisionMode);
 
     if (wantsMove) {
       driversOn();

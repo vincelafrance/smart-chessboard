@@ -118,6 +118,9 @@ static const ina3221_ch_t INA_CHANNEL = INA3221_CH1;
 // =======================================================
 // TMC2209 pins
 // =======================================================
+static const int TMC_UART_RX_PIN = 16; // ESP32 RX2
+static const int TMC_UART_TX_PIN = 17; // ESP32 TX2
+
 static const int LEFT_EN   = 13;
 static const int LEFT_STEP = 14;
 static const int LEFT_DIR  = 26;
@@ -163,7 +166,7 @@ static const float SPEED_XY_NORMAL = 4500.0f;
 static const float SPEED_XY_FAST   = 8000.0f;
 
 // Accel
-static const float ACCEL_AB = 45000.0f;
+static const float ACCEL_AB = 32000.0f;
 
 // Recenter / Path
 static const float RECENTER_KP = 2.0f;

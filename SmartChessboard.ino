@@ -9,6 +9,7 @@
 #include "Calibration.h"
 #include "StepTask.h"
 #include "MotionCoreXY.h"
+#include "DriversUART.h"
 
 unsigned long lastBattMs = 0;
 unsigned long lastPushMs = 0;
@@ -38,6 +39,8 @@ void setup() {
   gpio_set_direction((gpio_num_t)LEFT_DIR,  GPIO_MODE_OUTPUT);
   gpio_set_direction((gpio_num_t)RIGHT_STEP,GPIO_MODE_OUTPUT);
   gpio_set_direction((gpio_num_t)RIGHT_DIR, GPIO_MODE_OUTPUT);
+
+  initDriversUART();
 
   setDriversEnabled(false);
   Serial.println("[DRIVERS] boot -> OFF");
@@ -83,6 +86,9 @@ void loop() {
 
   // Hall poll + calibration sequencing
   calibrationLoop(now);
+
+  // Execute queued move requests once motion is idle.
+  commandsLoop();
 
   // Battery read
   if (now - lastBattMs >= 1000) {

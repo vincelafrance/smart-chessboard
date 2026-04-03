@@ -1,5 +1,6 @@
 #include "MotionCoreXY.h"
 #include "Utils.h"
+#include "DriversUART.h"
 
 void setDriversEnabled(bool en) {
   bool lvl = ENABLE_ACTIVE_LOW ? (en ? LOW : HIGH) : (en ? HIGH : LOW);
@@ -85,6 +86,13 @@ void xyToAB(float vx, float vy, float &vA, float &vB) {
 
 void getXYfromAB_raw(long aPos, long bPos, long &xAbs, long &yAbs) {
   if (SWAP_MOTORS_AB) { long t = aPos; aPos = bPos; bPos = t; }
+
+  const uint8_t ms = getDriversUARTMicrosteps();
+  if (ms != 0 && ms != 8) {
+    const float scaleToLogical = 8.0f / (float)ms;
+    aPos = (long)lroundf((float)aPos * scaleToLogical);
+    bPos = (long)lroundf((float)bPos * scaleToLogical);
+  }
 
   long dx = (aPos + bPos) / 2;
   long dy = (aPos - bPos) / 2;

@@ -77,7 +77,25 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   flex-direction:column;
   gap:8px;
   align-items:flex-start;
+  position:relative;
 }
+
+.boardLoading{
+  display:none;
+  position:absolute;
+  inset:34px 0 0 0;
+  align-items:center;
+  justify-content:center;
+  font-size:14px;
+  font-weight:700;
+  color:#e8eef6;
+  background:rgba(11,15,20,0.65);
+  border-radius:12px;
+  z-index:25;
+}
+
+.boardWrap.calibrating .board{opacity:.25; pointer-events:none;}
+.boardWrap.calibrating .boardLoading{display:flex;}
 
 
 .turnOverlay{
@@ -162,6 +180,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         <div style="margin-top:6px; display:flex; gap:10px; flex-wrap:wrap;">
           <button class="mini" id="center">Recentrer</button>
           <button class="mini" id="calibBtn">🎯 Calibration</button>
+          <button class="mini" id="diag4Btn">🧭 Test 1-2-3-4</button>
           <button class="mini" id="magnetBtn">🧲 Electroaimant: OFF</button>
         </div>
 
@@ -173,11 +192,12 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       <div class="gridWrap">
         <div>
           <div style="font-weight:700;margin-bottom:6px;">Sélection des cases</div>
-          <div class="legend">Tap sur une pièce = FROM (bleu). Puis tap destination = TO (vert). Ensuite "Send Move".</div>
-<div class="boardWrap">
+          <div class="legend">Tap sur une pièce = FROM (bleu). Puis tap destination = TO (vert) pour envoyer le coup.</div>
+<div class="boardWrap" id="boardWrap">
         <div id="turnOverlay" class="turnOverlay white">Tour: Blancs</div>
 
         <div id="board" class="board"></div>
+  <div id="boardLoading" class="boardLoading">Calibration en cours…</div>
       </div>
         </div>
         <div style="min-width:220px;">
@@ -189,7 +209,8 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             <div class="label">TO</div>
             <div class="val"><span id="toTxt">--</span></div>
           </div>
-          <button class="mini" id="sendMove" style="margin-top:12px;width:100%;">📦 Send Move</button>
+          <button class="mini" id="resetBoard" style="margin-top:10px;width:100%;">♻️ Reset Board</button>
+          <button class="mini" id="hardResetUi" style="margin-top:10px;width:100%;">🧹 Hard UI Reset</button>
           <button class="mini" id="swapMove" style="margin-top:10px;width:100%;">🔁 Swap</button>
         </div>
       </div>
@@ -217,7 +238,10 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 
   const magnetBtn = document.getElementById("magnetBtn");
   const calibBtn = document.getElementById("calibBtn");
+  const diag4Btn = document.getElementById("diag4Btn");
+  const boardWrapEl = document.getElementById("boardWrap");
   let magnetOn = false;
+  let calibBusy = false;
 
   function setStatus(msg, ok=true){
     statusEl.textContent = msg;
@@ -232,9 +256,11 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
     textEl.textContent = detected ? "MAGNET DETECTED" : "No magnet";
   }
   function updateCalibUI(active){
+    calibBusy = !!active;
     calibText.textContent = active ? "ON" : "OFF";
     calibBtn.classList.toggle("active", active);
     calibBtn.textContent = active ? "🎯 Calibration..." : "🎯 Calibration";
+    if(boardWrapEl) boardWrapEl.classList.toggle("calibrating", calibBusy);
   }
 
   const wsUrl = `ws://${location.hostname}:81/`;
@@ -307,6 +333,15 @@ const pieceSym = {
 
 // boardState maps "e4" -> pieceId like "wP5", "bQ", etc.
 let boardState = {};
+let deadZones = { L:new Array(16).fill(null), R:new Array(16).fill(null), nextL:15, nextR:15 };
+let pathBusy = false;
+let resetInProgress = false;
+const UI_STATE_KEY = "smartchess.ui.state.v1";
+let fwBusy = false;
+let fwPending = 0;
+let resetPlan = [];
+let resetPlanIndex = 0;
+let resetTargetBoard = null;
 
   // ======================================================
   // Chess rules (basic legality + king safety)
@@ -323,6 +358,79 @@ let boardState = {};
     castling = { wK:true, wQ:true, bK:true, bQ:true };
     epSquare = null;
     checkSquare = null;
+  }
+
+  function recomputeDeadZonePointers(){
+    deadZones.nextL = deadZones.L.length - 1;
+    while(deadZones.nextL >= 0 && deadZones.L[deadZones.nextL]) deadZones.nextL--;
+
+    deadZones.nextR = deadZones.R.length - 1;
+    while(deadZones.nextR >= 0 && deadZones.R[deadZones.nextR]) deadZones.nextR--;
+  }
+
+  function saveUiState(){
+    try {
+      const payload = {
+        boardState,
+        deadZones,
+        turn,
+        promoCountW,
+        promoCountB,
+        castling,
+        epSquare,
+      };
+      localStorage.setItem(UI_STATE_KEY, JSON.stringify(payload));
+    } catch(e) {}
+  }
+
+  function loadUiState(){
+    try {
+      const raw = localStorage.getItem(UI_STATE_KEY);
+      if(!raw) return false;
+
+      const saved = JSON.parse(raw);
+      if(!saved || typeof saved !== "object") return false;
+
+      if(!saved.boardState || typeof saved.boardState !== "object") return false;
+      boardState = saved.boardState;
+
+      if(saved.deadZones && Array.isArray(saved.deadZones.L) && Array.isArray(saved.deadZones.R)) {
+        deadZones = {
+          L: saved.deadZones.L.slice(0, 16),
+          R: saved.deadZones.R.slice(0, 16),
+          nextL: 15,
+          nextR: 15,
+        };
+        while(deadZones.L.length < 16) deadZones.L.push(null);
+        while(deadZones.R.length < 16) deadZones.R.push(null);
+      } else {
+        deadZones = { L:new Array(16).fill(null), R:new Array(16).fill(null), nextL:15, nextR:15 };
+      }
+      recomputeDeadZonePointers();
+
+      turn = (saved.turn === "b") ? "b" : "w";
+      promoCountW = Number.isFinite(saved.promoCountW) ? Math.max(0, saved.promoCountW|0) : 0;
+      promoCountB = Number.isFinite(saved.promoCountB) ? Math.max(0, saved.promoCountB|0) : 0;
+
+      const c = saved.castling || {};
+      castling = {
+        wK: !!c.wK,
+        wQ: !!c.wQ,
+        bK: !!c.bK,
+        bQ: !!c.bQ,
+      };
+      epSquare = (typeof saved.epSquare === "string" && saved.epSquare.length === 2) ? saved.epSquare : null;
+      checkSquare = null;
+
+      from = null;
+      to = null;
+      selectedPieceId = null;
+      if(typeof fromTxt!=="undefined") fromTxt.textContent = "--";
+      if(typeof toTxt!=="undefined") toTxt.textContent = "--";
+      return true;
+    } catch(e) {
+      return false;
+    }
   }
 
   function updateCheckState(){
@@ -387,6 +495,87 @@ let boardState = {};
       f += df; r += dr;
     }
     return true;
+  }
+
+  function isSlidingPiece(pid){
+    const t = pieceType(pid);
+    return (t === "B" || t === "R" || t === "Q");
+  }
+
+  function isPathClear(board, from, to, pid){
+    if(!pid) return true;
+    if(!isSlidingPiece(pid)) return true;
+    return rayClear(board, from.f, from.r, to.f, to.r);
+  }
+
+  const MAX_WP = 12;
+
+  function isBlocked(board, f, r, from, to){
+    if(from && f === from.f && r === from.r) return false;
+    if(to && f === to.f && r === to.r) return false;
+    return !!getPieceAt(board, f, r);
+  }
+
+  function canStepDiagonal(board, cur, nf, nr, from, to){
+    const df = nf - cur.f;
+    const dr = nr - cur.r;
+    if(Math.abs(df) !== 1 || Math.abs(dr) !== 1) return true;
+    const blockH = isBlocked(board, cur.f + df, cur.r, from, to);
+    const blockV = isBlocked(board, cur.f, cur.r + dr, from, to);
+    return !(blockH && blockV);
+  }
+
+  function findShortestPath(board, from, to){
+    if(!from || !to) return null;
+    const startKey = from.f + "," + from.r;
+    const goalKey = to.f + "," + to.r;
+
+    const queue = [from];
+    const visited = {};
+    const prev = {};
+    visited[startKey] = true;
+
+    const dirs = [
+      {df:1, dr:0},
+      {df:-1, dr:0},
+      {df:0, dr:1},
+      {df:0, dr:-1},
+      {df:1, dr:1},
+      {df:1, dr:-1},
+      {df:-1, dr:1},
+      {df:-1, dr:-1}
+    ];
+
+    while(queue.length){
+      const cur = queue.shift();
+      const curKey = cur.f + "," + cur.r;
+      if(curKey === goalKey) break;
+
+      for(const d of dirs){
+        const nf = cur.f + d.df;
+        const nr = cur.r + d.dr;
+        if(nf < 0 || nf > 7 || nr < 1 || nr > 8) continue;
+        if(isBlocked(board, nf, nr, from, to)) continue;
+        if(!canStepDiagonal(board, cur, nf, nr, from, to)) continue;
+        const nk = nf + "," + nr;
+        if(visited[nk]) continue;
+        visited[nk] = true;
+        prev[nk] = curKey;
+        queue.push({f:nf, r:nr});
+      }
+    }
+
+    if(!visited[goalKey]) return null;
+
+    const path = [];
+    let k = goalKey;
+    while(k){
+      const parts = k.split(",");
+      path.push({f:parseInt(parts[0],10), r:parseInt(parts[1],10)});
+      k = prev[k];
+    }
+    path.reverse();
+    return path;
   }
 
   function attacksSquare(board, fromSq, pid, targetSq){
@@ -615,6 +804,38 @@ let selectedPieceId = null;
 function sqKey(f,r){ return String.fromCharCode(97+f) + String(r); }
 function pieceBase(id){ return id ? id.slice(0,2) : null; }
 
+function addToCapturedZone(pid, side){
+  // side: 'L' or 'R'
+  if(!pid) return;
+  const zone = deadZones[side];
+  const key = side === 'L' ? 'nextL' : 'nextR';
+  if(deadZones[key] >= 0){
+    zone[deadZones[key]] = pid;
+    deadZones[key]--;
+  }
+}
+
+function removeCaptured(side, idx){
+  const zone = deadZones[side];
+  if(zone[idx]){
+    zone[idx] = null;
+  }
+}
+
+function getCapturedDisplay(side){
+  const zone = deadZones[side];
+  const captured = [];
+  for(let i = 0; i < zone.length; i++){
+    if(zone[i]){
+      const base = pieceBase(zone[i]);
+      if(pieceSym[base]){
+        captured.push({idx:i, sym:pieceSym[base], pid:zone[i], color:zone[i][0]});
+      }
+    }
+  }
+  return captured;
+}
+
 function resetStandardPosition(){
   turn = "w";
   promoCountW = 0; promoCountB = 0;
@@ -635,6 +856,7 @@ function resetStandardPosition(){
   from = null; to = null; selectedPieceId = null;
   if(typeof fromTxt!=="undefined") fromTxt.textContent="--";
   if(typeof toTxt!=="undefined") toTxt.textContent="--";
+  saveUiState();
 }
 
 function applyLocalMove(ff,fr,tf,tr){
@@ -646,6 +868,184 @@ function applyLocalMove(ff,fr,tf,tr){
   delete boardState[kFrom];
   boardState[kTo] = pid;
   return true;
+}
+
+function pieceBaseId(pid){ return pid ? pid.slice(0,2) : null; }
+
+function buildStandardBoardState(){
+  const target = {};
+  target["a1"]="wR"; target["b1"]="wN"; target["c1"]="wB"; target["d1"]="wQ";
+  target["e1"]="wK"; target["f1"]="wB"; target["g1"]="wN"; target["h1"]="wR";
+  for(const f of ["a","b","c","d","e","f","g","h"]) target[f+"2"] = "wP";
+
+  target["a8"]="bR"; target["b8"]="bN"; target["c8"]="bB"; target["d8"]="bQ";
+  target["e8"]="bK"; target["f8"]="bB"; target["g8"]="bN"; target["h8"]="bR";
+  for(const f of ["a","b","c","d","e","f","g","h"]) target[f+"7"] = "bP";
+  return target;
+}
+
+function allSquares(){
+  const out = [];
+  for(let r=1;r<=8;r++) for(let f=0;f<8;f++) out.push(xyToSq(f,r));
+  return out;
+}
+
+function findSquareWithBase(work, base, avoidSq){
+  for(const sq of allSquares()){
+    if(sq === avoidSq) continue;
+    const p = work[sq];
+    if(pieceBaseId(p) === base) return sq;
+  }
+  return null;
+}
+
+function findTempSquare(work, target, blocked){
+  for(const sq of allSquares()){
+    if(blocked && blocked[sq]) continue;
+    if(work[sq]) continue;
+    if(!target[sq]) return sq;
+  }
+  for(const sq of allSquares()){
+    if(blocked && blocked[sq]) continue;
+    if(!work[sq]) return sq;
+  }
+  return null;
+}
+
+function addPlannedMove(work, moves, fromSq, toSq){
+  const pid = work[fromSq];
+  if(!pid) return false;
+  delete work[fromSq];
+  work[toSq] = pid;
+  moves.push({fromSq, toSq});
+  return true;
+}
+
+function buildPhysicalResetPlan(currentBoard){
+  const target = buildStandardBoardState();
+  const work = cloneBoard(currentBoard);
+  const moves = [];
+
+  for(const targetSq of allSquares()){
+    const wantBase = pieceBaseId(target[targetSq]);
+    if(!wantBase) continue;
+
+    const curBase = pieceBaseId(work[targetSq]);
+    if(curBase === wantBase) continue;
+
+    const srcSq = findSquareWithBase(work, wantBase, targetSq);
+    if(!srcSq) continue;
+
+    if(work[targetSq]) {
+      const blocked = {};
+      blocked[targetSq] = true;
+      blocked[srcSq] = true;
+      const tmpSq = findTempSquare(work, target, blocked);
+      if(!tmpSq) continue;
+      addPlannedMove(work, moves, targetSq, tmpSq);
+    }
+
+    addPlannedMove(work, moves, srcSq, targetSq);
+  }
+
+  return {moves, target};
+}
+
+function dispatchResetMove(fromSq, toSq){
+  const from = sqToXY(fromSq);
+  const to = sqToXY(toSq);
+  const pid = getPieceAt(boardState, from.f, from.r);
+  const path = findShortestPath(boardState, from, to);
+
+  if(path && path.length >= 2 && path.length <= MAX_WP){
+    send({cmd:"pathMove", path});
+  } else {
+    // Prefer planner-based motion when BFS path is not available,
+    // to avoid straight-line drag-through across other pieces.
+    const isKing = pid && pieceType(pid) === "K";
+    const isCastleLike = isKing && (from.f === 4) && (Math.abs(to.f - from.f) === 2) && (from.r === 1 || from.r === 8) && (from.r === to.r);
+
+    if (isCastleLike) {
+      // Avoid castling special-case in squareMove during reset shuffling.
+      send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+    } else {
+      send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+    }
+  }
+
+  applyLocalMove(from.f, from.r, to.f, to.r);
+}
+
+function finishPhysicalReset(ok){
+  if(ok && resetTargetBoard){
+    boardState = cloneBoard(resetTargetBoard);
+    turn = "w";
+    promoCountW = 0;
+    promoCountB = 0;
+    resetSpecialRights();
+    deadZones = { L:new Array(16).fill(null), R:new Array(16).fill(null), nextL:15, nextR:15 };
+  }
+
+  from = null;
+  to = null;
+  selectedPieceId = null;
+  fromTxt.textContent = "--";
+  toTxt.textContent = "--";
+  updateCheckState();
+  updateTurnOverlay();
+  saveUiState();
+  renderBoard();
+
+  resetPlan = [];
+  resetPlanIndex = 0;
+  resetTargetBoard = null;
+  resetInProgress = false;
+  setStatus(ok ? "Pièces réinitialisées physiquement" : "Reset interrompu", ok);
+}
+
+function runPhysicalResetPump(){
+  if(!resetInProgress) return;
+  if(fwBusy || fwPending > 0) return;
+
+  while(resetPlanIndex < resetPlan.length){
+    const step = resetPlan[resetPlanIndex];
+    const pid = boardState[step.fromSq];
+    if(!pid){
+      resetPlanIndex++;
+      continue;
+    }
+
+    dispatchResetMove(step.fromSq, step.toSq);
+    resetPlanIndex++;
+    setStatus("Reset physique: " + resetPlanIndex + "/" + resetPlan.length, true);
+    saveUiState();
+    renderBoard();
+    return;
+  }
+
+  finishPhysicalReset(true);
+}
+
+function startPhysicalReset(){
+  if(resetInProgress){
+    setStatus("Reset déjà en cours...", false);
+    return;
+  }
+
+  const planData = buildPhysicalResetPlan(boardState);
+  resetPlan = planData.moves;
+  resetPlanIndex = 0;
+  resetTargetBoard = planData.target;
+
+  if(resetPlan.length === 0){
+    finishPhysicalReset(true);
+    return;
+  }
+
+  resetInProgress = true;
+  send({cmd:"resetPieces"});
+  setStatus("Préparation du reset physique...", true);
+  runPhysicalResetPump();
 }
 
   function renderBoard(){
@@ -676,15 +1076,11 @@ const pid = boardState[key];
       if(from && from.f===f && from.r===r) div.classList.add("selFrom");
       if(to   && to.f===f   && to.r===r)   div.classList.add("selTo");
 
-      div.addEventListener("pointerdown", (e)=>{ 
-        // track press duration for long-press TO selection
-        div._pressT = performance.now();
-      });
-
       div.addEventListener("pointerup", (e)=>{
-        const now = performance.now();
-        const heldMs = (div._pressT ? (now - div._pressT) : 0);
-        div._pressT = null;
+        if(resetInProgress){
+          setStatus("Reset en cours, attends la fin des déplacements.", false);
+          return;
+        }
 
         // ----------------------------
         // Step 0: no FROM yet -> pick a piece with a normal tap/click
@@ -703,15 +1099,8 @@ const pid = boardState[key];
           return;
         }
 
-        // ----------------------------
-        // If user taps/clicks an occupied square, allow changing FROM to that piece
-        // (unless this is a long-press intended for TO)
-        // ----------------------------
-        const LONGPRESS_TO_MS = 260; // adjust if needed
-        const isLongPress = heldMs >= LONGPRESS_TO_MS;
-
-        // Tapping the same FROM square toggles off (short press)
-        if(from && from.f===f && from.r===r && !isLongPress){
+        // Tapping the same FROM square toggles off.
+        if(from && from.f===f && from.r===r){
           from = null;
           selectedPieceId = null;
           fromTxt.textContent = "--";
@@ -721,8 +1110,9 @@ const pid = boardState[key];
           return;
         }
 
-        // Short press on another occupied square -> switch FROM
-        if(pid && !isLongPress){
+        // Clicking another friendly piece switches FROM.
+        const fromPid = selectedPieceId || getPieceAt(boardState, from.f, from.r);
+        if(pid && fromPid && pieceColor(pid) === pieceColor(fromPid)){
           from = {f,r};
           selectedPieceId = pid;
           fromTxt.textContent = key;
@@ -732,17 +1122,11 @@ const pid = boardState[key];
           return;
         }
 
-        // ----------------------------
-        // Long-press selects TO (even if occupied = capture)
-        // ----------------------------
-        if(!isLongPress){
-          setStatus("Pour sélectionner la destination (TO), fais un appui un peu plus long sur la case.", false);
-          return;
-        }
-
+        // Otherwise this click is TO, then send move immediately.
         to = {f,r};
         toTxt.textContent = key;
         renderBoard();
+        executeSelectedMove();
       });
 
       boardEl.appendChild(div);
@@ -750,7 +1134,12 @@ const pid = boardState[key];
   }
 }
 
-  document.getElementById("sendMove").addEventListener("click", ()=>{
+  function executeSelectedMove(){
+    if(resetInProgress){
+      setStatus("Reset en cours, mouvement manuel temporairement bloqué.", false);
+      return;
+    }
+
     if(!from || !to){
       setStatus("Sélectionne une pièce (FROM), puis une destination (TO).", false);
       return;
@@ -766,7 +1155,119 @@ const pid = boardState[key];
       return;
     }
 
-    send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+    const pid = getPieceAt(boardState, from.f, from.r);
+    const t = pieceType(pid);
+
+    if (t === "K" && Math.abs(to.f - from.f) === 2) {
+      send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+    } else if (t === "N") {
+      const path = findShortestPath(boardState, from, to);
+      if(!path || path.length < 2){
+        // Check for capture BEFORE applying move
+        const destPid = getPieceAt(boardState, to.f, to.r);
+        if(destPid){
+          const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
+          addToCapturedZone(destPid, destSide);
+        }
+        send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+        boardState = res.nextBoard;
+        if(res.rightsUpdate){
+          castling = Object.assign({}, castling, res.rightsUpdate);
+        }
+        epSquare = res.epNext ? res.epNext : null;
+
+        from = null; to = null; selectedPieceId = null;
+        fromTxt.textContent = "--";
+        toTxt.textContent = "--";
+
+        turn = (turn === "w") ? "b" : "w";
+        updateTurnOverlay();
+
+        updateCheckState();
+        if(checkSquare){
+          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
+        } else if(res.givesCheck){
+          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
+        } else {
+          setStatus("OK. Tour: " + (turn==="w" ? "Blancs" : "Noirs"), true);
+        }
+
+        renderBoard();
+        saveUiState();
+        return;
+      }
+      if(path.length > MAX_WP){
+        // Check for capture BEFORE applying move
+        const destPid = getPieceAt(boardState, to.f, to.r);
+        if(destPid){
+          const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
+          addToCapturedZone(destPid, destSide);
+        }
+        send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+        boardState = res.nextBoard;
+        if(res.rightsUpdate){
+          castling = Object.assign({}, castling, res.rightsUpdate);
+        }
+        epSquare = res.epNext ? res.epNext : null;
+
+        from = null; to = null; selectedPieceId = null;
+        fromTxt.textContent = "--";
+        toTxt.textContent = "--";
+
+        turn = (turn === "w") ? "b" : "w";
+        updateTurnOverlay();
+
+        updateCheckState();
+        if(checkSquare){
+          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
+        } else if(res.givesCheck){
+          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
+        } else {
+          setStatus("OK. Tour: " + (turn==="w" ? "Blancs" : "Noirs"), true);
+        }
+
+        renderBoard();
+        saveUiState();
+        return;
+      }
+      send({cmd:"pathMove", path});
+    } else if (isSlidingPiece(pid)) {
+      const clear = isPathClear(boardState, from, to, pid);
+      if (clear) {
+        // Check for capture BEFORE applying move
+        const destPid = getPieceAt(boardState, to.f, to.r);
+        if(destPid){
+          const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
+          addToCapturedZone(destPid, destSide);
+        }
+        send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+      } else {
+        const path = findShortestPath(boardState, from, to);
+        if(!path || path.length < 2){
+          setStatus("Chemin physique bloqué pour cette pièce.", false);
+          return;
+        }
+        if(path.length > MAX_WP){
+          setStatus("Chemin trop long pour le déplacement physique.", false);
+          return;
+        }
+        // Check for capture BEFORE applying move
+        const destPidPath = getPieceAt(boardState, to.f, to.r);
+        if(destPidPath){
+          const destSide = pieceColor(destPidPath) === 'w' ? 'L' : 'R';
+          addToCapturedZone(destPidPath, destSide);
+        }
+        send({cmd:"pathMove", path});
+      }
+    } else {
+      // Check for capture BEFORE applying move
+      const destPid = getPieceAt(boardState, to.f, to.r);
+      if(destPid){
+        const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
+        addToCapturedZone(destPid, destSide);
+      }
+      send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+    }
 
     boardState = res.nextBoard;
 
@@ -792,7 +1293,8 @@ const pid = boardState[key];
     }
 
     renderBoard();
-  });
+    saveUiState();
+  }
 
   document.getElementById("swapMove").addEventListener("click", ()=>{
     const tmp = from; from = to; to = tmp;
@@ -831,6 +1333,9 @@ const pid = boardState[key];
         if (typeof d.hallY !== "undefined") updateHallUI(hallYDot, hallYText, !!d.hallY);
         if (typeof d.hallX !== "undefined") updateHallUI(hallXDot, hallXText, !!d.hallX);
         if (typeof d.calib !== "undefined") updateCalibUI(!!d.calib);
+        if (typeof d.busy !== "undefined") fwBusy = !!d.busy;
+        if (typeof d.pending !== "undefined") fwPending = (d.pending|0);
+        runPhysicalResetPump();
       } catch(e) {}
     };
   }
@@ -858,13 +1363,31 @@ const pid = boardState[key];
     updateMagnetUI(magnetOn);
   });
 
+  diag4Btn.addEventListener("click", ()=>{
+    stopHold();
+    send({cmd:"diag4"});
+    setStatus("Test 1-2-3-4 envoyé", true);
+  });
+
+  document.getElementById("resetBoard").addEventListener("click", ()=>{
+    startPhysicalReset();
+  });
+
+  document.getElementById("hardResetUi").addEventListener("click", ()=>{
+    if(confirm("Êtes-vous sûr de vouloir faire un Hard Reset? Cela reinitalisera tout.")){
+      try { localStorage.removeItem(UI_STATE_KEY); } catch(e) {}
+      location.reload();
+    }
+  });
+
   updateHallUI(hallYDot, hallYText, false);
   updateHallUI(hallXDot, hallXText, false);
   updateCalibUI(false);
   fromTxt.textContent = "--";
   toTxt.textContent = "--";
-  resetStandardPosition();
-  setStatus('Tour: Blancs', true);
+  if(!loadUiState()) resetStandardPosition();
+  updateCheckState();
+  setStatus('Tour: ' + (turn === "w" ? "Blancs" : "Noirs"), true);
   updateTurnOverlay();
   renderBoard();
   connect();
@@ -894,6 +1417,8 @@ void webPushTelemetry() {
   long cxAbs, cyAbs;
   uint8_t sp;
   bool magOn, hallY, hallX, calib;
+  bool busy;
+  uint8_t pending;
 
   portENTER_CRITICAL(&gMux);
   v = g_battV;
@@ -912,16 +1437,20 @@ void webPushTelemetry() {
 
   long xDisp = xAbs - cxAbs;
   long yDisp = yAbs - cyAbs;
+  busy = commandsIsBusy();
+  pending = commandsPendingCount();
 
   char msg[520];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
-           "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s}",
+           "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,\"busy\":%s,\"pending\":%u}",
            pct, v, i, xDisp, yDisp, (unsigned)sp,
            (magOn ? "true" : "false"),
            (hallY ? "true" : "false"),
            (hallX ? "true" : "false"),
-           (calib ? "true" : "false"));
+           (calib ? "true" : "false"),
+           (busy ? "true" : "false"),
+           (unsigned)pending);
 
   webSocket.broadcastTXT(msg);
 }

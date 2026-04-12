@@ -45,7 +45,14 @@ static const int   CALIB_X_DIR    = -1;
 static const bool  HALL_AT_Y_MIN  = true;
 static const bool  HALL_AT_X_MIN  = true;
 
-enum CalibState : uint8_t { CALIB_IDLE=0, CALIB_Y=1, CALIB_X=2, CALIB_RECENTER=3 };
+enum CalibState : uint8_t {
+	CALIB_IDLE = 0,
+	CALIB_Y_BOTTOM = 1,
+	CALIB_X_BOTTOM = 2,
+	CALIB_Y_TOP = 3,
+	CALIB_X_TOP = 4,
+	CALIB_RECENTER = 5,
+};
 
 extern volatile CalibState g_calibState;
 
@@ -167,14 +174,27 @@ static const float SPEED_XY_FAST   = 8000.0f;
 
 // Accel
 static const float ACCEL_AB = 32000.0f;
+static const float PATH_ACCEL_AB = 14000.0f;
+static const float PATH_ACCEL_AB_DIAG = 2000.0f;
+static const float PATH_DIAG_SINGLE_MOTOR_RATIO = 0.35f;
 
 // Recenter / Path
 static const float RECENTER_KP = 2.0f;
 static const float RECENTER_VMAX_XY = 7000.0f;
 static const float RECENTER_RAMP_ACC = 9000.0f;
 static const float RECENTER_MIN_VXY = 350.0f;
+static const float RECENTER_X_CAP_SCALE = 0.55f;
+static const float RECENTER_X_MIN_VXY = 220.0f;
 static const long  RECENTER_DEADBAND_XY = 12;
 static const unsigned long RECENTER_SETTLE_MS = 120;
+
+// Faster piece movement profile (independent from recenter calibration behavior)
+static const float PATH_VMAX_XY = 8600.0f;
+static const float PATH_RAMP_ACC = 6000.0f;
+static const float PATH_KP = 2.0f;
+static const float PATH_MIN_VXY = 380.0f;
+static const unsigned long PATH_SETTLE_MS = 70;
+static const unsigned long PATH_PICKUP_SETTLE_MS = 180;
 
 // Auto disable
 static const bool DRIVERS_AUTO_DISABLE = true;

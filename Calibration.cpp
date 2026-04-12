@@ -4,6 +4,12 @@
 #include "PathPlanner.h"
 #include "BoardMapping.h"
 
+static const unsigned long CALIB_HALL_POLL_MS = 2;
+static long s_yBottom = 0;
+static long s_xBottom = 0;
+static long s_yTop = 0;
+static long s_xTop = 0;
+
 void startFullCalibration() {
   int sy = digitalRead(HALL_Y_PIN);
   int sx = digitalRead(HALL_X_PIN);
@@ -25,15 +31,16 @@ void startFullCalibration() {
   g_recenter = false;
   g_vx_xy = 0;
   g_vy_xy = 0;
-  g_calibState = CALIB_Y;
+  g_calibState = CALIB_Y_BOTTOM;
   g_lastCmdMs = now;
   portEXIT_CRITICAL(&gMux);
 
-  Serial.println("[CALIB] Full sequence started: Y -> X -> Recenter");
+  s_yBottom = s_xBottom = s_yTop = s_xTop = 0;
+  Serial.println("[CALIB] Full sequence started: Bas(Y->X) -> Haut(Y->X) -> Recenter");
 }
 
 void calibrationLoop(unsigned long now) {
-  if (now - lastHallPollMs < 10) return;
+  if (now - lastHallPollMs < CALIB_HALL_POLL_MS) return;
   lastHallPollMs = now;
 
   int stateY = digitalRead(HALL_Y_PIN);
@@ -54,42 +61,34 @@ void calibrationLoop(unsigned long now) {
     int prev = lastHallYState;
     lastHallYState = stateY;
 
-    if (st == CALIB_Y && prev == HIGH && stateY == LOW) {
-      long hallY = yNowAbs;
-
-      long newMin, newMax, newCenter;
-      if (HALL_AT_Y_MIN) {
-        newMin = hallY;
-        newMax = hallY + Y_SPAN_STEPS;
-        newCenter = hallY + (Y_SPAN_STEPS / 2);
-      } else {
-        newMax = hallY;
-        newMin = hallY - Y_SPAN_STEPS;
-        newCenter = hallY - (Y_SPAN_STEPS / 2);
-      }
+    if (prev == HIGH && stateY == LOW && st == CALIB_Y_BOTTOM) {
+      s_yBottom = yNowAbs;
 
       portENTER_CRITICAL(&gMux);
-      g_yHallPos = hallY;
-      g_yHardMin = newMin;
-      g_yHardMax = newMax;
-      g_yCenterTarget = newCenter;
-      g_yLimitsCalibrated = true;
-
-      g_calibState = CALIB_X;
+      g_yHallPos = s_yBottom;
+      g_calibState = CALIB_X_BOTTOM;
       g_lastCmdMs = now;
       portEXIT_CRITICAL(&gMux);
 
-      Serial.print("[Y CAL] hallY=");
-      Serial.print(hallY);
-      Serial.print(" -> ymin=");
-      Serial.print(newMin);
-      Serial.print(" ymax=");
-      Serial.print(newMax);
-      Serial.print(" centerTarget=");
-      Serial.println(newCenter);
+      Serial.print("[CALIB BAS] Y detecte a y=");
+      Serial.println(s_yBottom);
 
       if (digitalRead(HALL_X_PIN) == LOW) {
-        Serial.println("[X CAL] Refused mid-sequence: hall X already DETECTED. Move away and retry.");
+        Serial.println("[CALIB BAS] Hall X encore LOW au changement d'etat, poursuite vers Haut pour sortir de la zone capteur.");
+      }
+    } else if (prev == HIGH && stateY == LOW && st == CALIB_Y_TOP) {
+      s_yTop = yNowAbs;
+
+      portENTER_CRITICAL(&gMux);
+      g_calibState = CALIB_X_TOP;
+      g_lastCmdMs = now;
+      portEXIT_CRITICAL(&gMux);
+
+      Serial.print("[CALIB HAUT] Y detecte a y=");
+      Serial.println(s_yTop);
+
+      if (digitalRead(HALL_X_PIN) == LOW) {
+        Serial.println("[CALIB HAUT] Refuse: hall X deja DETECTED. Move away and retry.");
         portENTER_CRITICAL(&gMux);
         g_calibState = CALIB_IDLE;
         g_vx_xy = 0; g_vy_xy = 0;
@@ -104,25 +103,39 @@ void calibrationLoop(unsigned long now) {
     int prev = lastHallXState;
     lastHallXState = stateX;
 
-    if (st == CALIB_X && prev == HIGH && stateX == LOW) {
-      long hallX = xNowAbs;
-
-      long newMin, newMax, newCenter;
-      if (HALL_AT_X_MIN) {
-        newMin = hallX;
-        newMax = hallX + X_SPAN_STEPS;
-        newCenter = hallX + (X_SPAN_STEPS / 2);
-      } else {
-        newMax = hallX;
-        newMin = hallX - X_SPAN_STEPS;
-        newCenter = hallX - (X_SPAN_STEPS / 2);
-      }
+    if (prev == HIGH && stateX == LOW && st == CALIB_X_BOTTOM) {
+      s_xBottom = xNowAbs;
 
       portENTER_CRITICAL(&gMux);
-      g_xHallPos = hallX;
-      g_xHardMin = newMin;
-      g_xHardMax = newMax;
-      g_xCenterTarget = newCenter;
+      g_xHallPos = s_xBottom;
+      g_calibState = CALIB_Y_TOP;
+      g_lastCmdMs = now;
+      portEXIT_CRITICAL(&gMux);
+
+      Serial.print("[CALIB BAS] X detecte a x=");
+      Serial.println(s_xBottom);
+
+      if (digitalRead(HALL_Y_PIN) == LOW) {
+        Serial.println("[CALIB BAS] Hall Y encore LOW au changement d'etat, poursuite vers Haut pour sortir de la zone capteur.");
+      }
+    } else if (prev == HIGH && stateX == LOW && st == CALIB_X_TOP) {
+      s_xTop = xNowAbs;
+
+      long yMin = min(s_yBottom, s_yTop);
+      long yMax = max(s_yBottom, s_yTop);
+      long xMin = min(s_xBottom, s_xTop);
+      long xMax = max(s_xBottom, s_xTop);
+      long yCenter = (yMin + yMax) / 2L;
+      long xCenter = (xMin + xMax) / 2L;
+
+      portENTER_CRITICAL(&gMux);
+      g_yHardMin = yMin;
+      g_yHardMax = yMax;
+      g_xHardMin = xMin;
+      g_xHardMax = xMax;
+      g_yCenterTarget = yCenter;
+      g_xCenterTarget = xCenter;
+      g_yLimitsCalibrated = true;
       g_xLimitsCalibrated = true;
 
       g_calibState = CALIB_RECENTER;
@@ -131,14 +144,9 @@ void calibrationLoop(unsigned long now) {
       g_lastCmdMs = now;
       portEXIT_CRITICAL(&gMux);
 
-      Serial.print("[X CAL] hallX=");
-      Serial.print(hallX);
-      Serial.print(" -> xmin=");
-      Serial.print(newMin);
-      Serial.print(" xmax=");
-      Serial.print(newMax);
-      Serial.print(" centerTarget=");
-      Serial.println(newCenter);
+      Serial.printf("[CALIB HAUT] X detecte a x=%ld\n", s_xTop);
+      Serial.printf("[CALIB] Coin Bas=(x=%ld,y=%ld) Coin Haut=(x=%ld,y=%ld)\n", s_xBottom, s_yBottom, s_xTop, s_yTop);
+      Serial.printf("[CALIB] Centre calcule=(x=%ld,y=%ld)\n", xCenter, yCenter);
 
       long oxAbs, oyAbs;
       portENTER_CRITICAL(&gMux);

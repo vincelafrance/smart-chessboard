@@ -20,6 +20,9 @@ static void stepTask(void *param) {
   float vmaxCur = 0.0f;
   uint32_t prevUsRamp = 0;
   static uint32_t prevUs = 0;
+  static bool pickupWaitActive = false;
+  static unsigned long pickupWaitStartMs = 0;
+  static uint8_t pickupWaitWpIdx = 255;
 
   for (;;) {
     uint32_t nowUs = micros();
@@ -52,8 +55,8 @@ static void stepTask(void *param) {
     lastCmd = g_lastCmdMs;
     portEXIT_CRITICAL(&gMux);
 
-    const bool calibY = (calibState == CALIB_Y);
-    const bool calibX = (calibState == CALIB_X);
+    const bool calibY = (calibState == CALIB_Y_BOTTOM || calibState == CALIB_Y_TOP);
+    const bool calibX = (calibState == CALIB_X_BOTTOM || calibState == CALIB_X_TOP);
 
     long xMin, xMax, yMin, yMax;
     getXLimits(xMin, xMax);
@@ -91,11 +94,13 @@ static void stepTask(void *param) {
 
     if (calibY) {
       vx_t = 0.0f;
-      vy_t = (float)CALIB_Y_DIR * CALIB_Y_SPEED;
+      float dirY = (calibState == CALIB_Y_TOP) ? -(float)CALIB_Y_DIR : (float)CALIB_Y_DIR;
+      vy_t = dirY * CALIB_Y_SPEED;
       vmaxCur = 0.0f; prevUsRamp = 0; settleStartMs = 0;
     }
     else if (calibX) {
-      vx_t = (float)CALIB_X_DIR * CALIB_X_SPEED;
+      float dirX = (calibState == CALIB_X_TOP) ? -(float)CALIB_X_DIR : (float)CALIB_X_DIR;
+      vx_t = dirX * CALIB_X_SPEED;
       vy_t = 0.0f;
       vmaxCur = 0.0f; prevUsRamp = 0; settleStartMs = 0;
     }
@@ -112,19 +117,30 @@ static void stepTask(void *param) {
       }
       prevUsRamp = nowUs;
 
-      float rampMaxDelta = RECENTER_RAMP_ACC * dtRamp;
-      vmaxCur = approachf(vmaxCur, RECENTER_VMAX_XY, rampMaxDelta);
-      float vCap = clampf(vmaxCur, 400.0f, RECENTER_VMAX_XY);
+      float rampMaxDelta = PATH_RAMP_ACC * dtRamp;
+      vmaxCur = approachf(vmaxCur, PATH_VMAX_XY, rampMaxDelta);
+      float vCap = clampf(vmaxCur, 500.0f, PATH_VMAX_XY);
 
       const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
       const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);
 
       if (!xDone || !yDone) {
+        float minPathV = PATH_MIN_VXY;
         if (!xDone && !yDone) {
-          vCap *= 0.7f;
+          vCap *= 0.35f;
+          minPathV *= 0.5f;
         }
-        float vx_raw = RECENTER_KP * (float)ex;
-        float vy_raw = RECENTER_KP * (float)ey;
+
+        // Taper minimum speed near target to reduce end-of-diagonal bounce.
+        const float errMag = fmaxf(fabsf((float)ex), fabsf((float)ey));
+        if (errMag < 180.0f) {
+          float t = clampf(errMag / 180.0f, 0.0f, 1.0f);
+          const float minNear = 70.0f;
+          minPathV = minNear + (minPathV - minNear) * t;
+        }
+
+        float vx_raw = PATH_KP * (float)ex;
+        float vy_raw = PATH_KP * (float)ey;
 
         float maxAbs = fmaxf(fabsf(vx_raw), fabsf(vy_raw));
         float scale = 1.0f;
@@ -133,59 +149,40 @@ static void stepTask(void *param) {
         vx_t = vx_raw * scale;
         vy_t = vy_raw * scale;
 
-        if (!xDone && fabsf(vx_t) < RECENTER_MIN_VXY) vx_t = (ex >= 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
-        if (!yDone && fabsf(vy_t) < RECENTER_MIN_VXY) vy_t = (ey >= 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
+        const bool xVeryNear = (labs(ex) <= (RECENTER_DEADBAND_XY * 2));
+        const bool yVeryNear = (labs(ey) <= (RECENTER_DEADBAND_XY * 2));
+
+        if (!xDone && !xVeryNear && fabsf(vx_t) < minPathV) vx_t = (ex >= 0) ? minPathV : -minPathV;
+        if (!yDone && !yVeryNear && fabsf(vy_t) < minPathV) vy_t = (ey >= 0) ? minPathV : -minPathV;
 
         settleStartMs = 0;
       } else {
-        if (settleStartMs == 0) settleStartMs = nowMs;
+        uint8_t arrivedIdx = 0, cnt = 0;
+        bool autoMag = false;
+        int8_t magAction = -1;
 
-        if (nowMs - settleStartMs >= RECENTER_SETTLE_MS) {
-          uint8_t arrivedIdx, cnt;
-          bool autoMag;
+        portENTER_CRITICAL(&gMux);
+        arrivedIdx = g_wpIndex;
+        cnt = g_wpCount;
+        autoMag = g_autoMagnetPath;
+        if (arrivedIdx < g_wpCount) magAction = g_waypoints[arrivedIdx].mag;
+        portEXIT_CRITICAL(&gMux);
 
+        const bool isFinalWp = (cnt > 0 && arrivedIdx == (uint8_t)(cnt - 1));
+        bool needsSettle = isFinalWp;
+
+        if (autoMag) {
+          if (magAction == 1 || magAction == 0) {
+            needsSettle = true;
+          } else if (magAction == -1 && arrivedIdx == 1) {
+            // Backwards-compat: old path format picks up at waypoint #1.
+            needsSettle = true;
+          }
+        }
+
+        // Intermediate waypoints without actions are passed continuously.
+        if (!needsSettle) {
           portENTER_CRITICAL(&gMux);
-          arrivedIdx = g_wpIndex;
-          cnt = g_wpCount;
-          autoMag = g_autoMagnetPath;
-          portEXIT_CRITICAL(&gMux);
-if (autoMag) {
-  // Waypoint-driven magnet control (supports multi-piece sequences, e.g. castling)
-  int8_t magAction = -1;
-  portENTER_CRITICAL(&gMux);
-  if (arrivedIdx < g_wpCount) magAction = g_waypoints[arrivedIdx].mag;
-  portEXIT_CRITICAL(&gMux);
-
-  if (magAction == 1) {
-    magnetSet(true);
-    Serial.println("[MAGNET] AUTO ON at waypoint");
-  } else if (magAction == 0) {
-    magnetSet(false);
-    Serial.println("[MAGNET] AUTO OFF at waypoint");
-  }
-
-  // Backwards-compat: if mag actions are not used (-1), keep old behavior
-  if (magAction == -1) {
-    if (arrivedIdx == 1) {
-      magnetSet(true);
-      Serial.println("[MAGNET] AUTO ON at FROM center");
-    }
-    if (cnt > 0 && arrivedIdx == (uint8_t)(cnt - 1)) {
-      magnetSet(false);
-      Serial.println("[MAGNET] AUTO OFF at TO center");
-      portENTER_CRITICAL(&gMux);
-      g_autoMagnetPath = false;
-      portEXIT_CRITICAL(&gMux);
-    }
-  } else {
-    // If we used waypoint actions, only auto-stop at the final waypoint.
-    if (cnt > 0 && arrivedIdx == (uint8_t)(cnt - 1)) {
-      portENTER_CRITICAL(&gMux);
-      g_autoMagnetPath = false;
-      portEXIT_CRITICAL(&gMux);
-    }
-  }
-}portENTER_CRITICAL(&gMux);
           uint8_t idx = g_wpIndex;
           uint8_t c = g_wpCount;
           idx++;
@@ -202,8 +199,89 @@ if (autoMag) {
           portEXIT_CRITICAL(&gMux);
 
           settleStartMs = 0;
-          vmaxCur = 0.0f;
-          prevUsRamp = 0;
+          continue;
+        }
+
+        if (settleStartMs == 0) settleStartMs = nowMs;
+
+        if (nowMs - settleStartMs >= PATH_SETTLE_MS) {
+          bool needPickupDelay = false;
+
+          if (autoMag) {
+            // Waypoint-driven magnet control (supports multi-piece sequences, e.g. castling)
+            if (magAction == 1) {
+              magnetSet(true);
+              Serial.println("[MAGNET] AUTO ON at waypoint");
+              needPickupDelay = true;
+            } else if (magAction == 0) {
+              magnetSet(false);
+              Serial.println("[MAGNET] AUTO OFF at waypoint");
+            }
+
+            // Backwards-compat: if mag actions are not used (-1), keep old behavior
+            if (magAction == -1) {
+              if (arrivedIdx == 1) {
+                magnetSet(true);
+                Serial.println("[MAGNET] AUTO ON at FROM center");
+                needPickupDelay = true;
+              }
+              if (isFinalWp) {
+                magnetSet(false);
+                Serial.println("[MAGNET] AUTO OFF at TO center");
+                portENTER_CRITICAL(&gMux);
+                g_autoMagnetPath = false;
+                portEXIT_CRITICAL(&gMux);
+              }
+            } else {
+              // If we used waypoint actions, only auto-stop at the final waypoint.
+              if (isFinalWp) {
+                portENTER_CRITICAL(&gMux);
+                g_autoMagnetPath = false;
+                portEXIT_CRITICAL(&gMux);
+              }
+            }
+
+            // Hold briefly after a pickup to let the piece fully attach before moving away.
+            if (needPickupDelay) {
+              if (!pickupWaitActive || pickupWaitWpIdx != arrivedIdx) {
+                pickupWaitActive = true;
+                pickupWaitWpIdx = arrivedIdx;
+                pickupWaitStartMs = nowMs;
+              }
+              if ((nowMs - pickupWaitStartMs) < PATH_PICKUP_SETTLE_MS) {
+                vx_t = 0.0f;
+                vy_t = 0.0f;
+                continue;
+              }
+              pickupWaitActive = false;
+              pickupWaitWpIdx = 255;
+            } else if (pickupWaitActive && pickupWaitWpIdx == arrivedIdx) {
+              pickupWaitActive = false;
+              pickupWaitWpIdx = 255;
+            }
+          }
+
+          portENTER_CRITICAL(&gMux);
+          uint8_t idx = g_wpIndex;
+          uint8_t c = g_wpCount;
+          idx++;
+          if (idx >= c) {
+            g_pathActive = false;
+            g_wpCount = 0;
+            g_wpIndex = 0;
+          } else {
+            g_wpIndex = idx;
+            g_pathTargetX = g_waypoints[idx].x;
+            g_pathTargetY = g_waypoints[idx].y;
+          }
+          g_lastCmdMs = nowMs;
+          portEXIT_CRITICAL(&gMux);
+
+          settleStartMs = 0;
+          if (isFinalWp) {
+            vmaxCur = 0.0f;
+            prevUsRamp = 0;
+          }
         }
 
         vx_t = 0.0f;
@@ -243,8 +321,9 @@ if (autoMag) {
         settleStartMs = 0;
       } else if (!xDone) {
         vy_t = 0.0f;
-        vx_t = clampf(RECENTER_KP * (float)ex, -vCap, +vCap);
-        if (fabs(vx_t) > 0.0f && fabs(vx_t) < RECENTER_MIN_VXY) vx_t = (vx_t > 0) ? RECENTER_MIN_VXY : -RECENTER_MIN_VXY;
+        float vCapX = fmaxf(180.0f, vCap * RECENTER_X_CAP_SCALE);
+        vx_t = clampf(RECENTER_KP * (float)ex, -vCapX, +vCapX);
+        if (fabs(vx_t) > 0.0f && fabs(vx_t) < RECENTER_X_MIN_VXY) vx_t = (vx_t > 0) ? RECENTER_X_MIN_VXY : -RECENTER_X_MIN_VXY;
         settleStartMs = 0;
       } else {
         if (settleStartMs == 0) settleStartMs = nowMs;
@@ -289,7 +368,19 @@ if (autoMag) {
     }
     prevUs = nowUs;
 
-    float maxDv = ACCEL_AB * dt;
+    float accelAB = ACCEL_AB;
+    if (pathActive) {
+      accelAB = PATH_ACCEL_AB;
+      const float aAbs = fabsf(vA_t);
+      const float bAbs = fabsf(vB_t);
+      const float hi = fmaxf(aAbs, bAbs);
+      const float lo = fminf(aAbs, bAbs);
+      if (hi > 200.0f && lo < (hi * PATH_DIAG_SINGLE_MOTOR_RATIO)) {
+        accelAB = PATH_ACCEL_AB_DIAG;
+      }
+    }
+
+    float maxDv = accelAB * dt;
     vA_cur = approachf(vA_cur, vA_t, maxDv);
     vB_cur = approachf(vB_cur, vB_t, maxDv);
 

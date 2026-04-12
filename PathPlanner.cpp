@@ -3,6 +3,7 @@
 #include "MotionCoreXY.h"
 #include "Magnet.h"
 #include "BoardMapping.h"
+#include "DriversUART.h"
 
 static inline float dist2(long ax,long ay,long bx,long by){
   float dx = (float)(ax - bx);
@@ -126,6 +127,19 @@ static inline void squareInternalPoint(uint8_t f0, uint8_t r1, float uOffset, fl
 void beginMoveSeq(const Waypoint *wps, uint8_t n) {
   if (!wps || n == 0) return;
   if (n > MAX_WAYPOINTS) n = MAX_WAYPOINTS;
+
+  // Select the per-group current profile before the first step, based on the
+  // overall move vector (start -> final waypoint).  Done outside the critical
+  // section because selectCurrentsForMove only reads shared position under
+  // its own brief lock.
+  {
+    long fromX, fromY;
+    portENTER_CRITICAL(&gMux);
+    fromX = g_xAbs;
+    fromY = g_yAbs;
+    portEXIT_CRITICAL(&gMux);
+    selectCurrentsForMove(fromX, fromY, wps[n - 1].x, wps[n - 1].y);
+  }
 
   portENTER_CRITICAL(&gMux);
   for (uint8_t i = 0; i < n; i++) g_waypoints[i] = wps[i];

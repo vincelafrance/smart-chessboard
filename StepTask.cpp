@@ -117,15 +117,20 @@ static void stepTask(void *param) {
       }
       prevUsRamp = nowUs;
 
-      float rampMaxDelta = PATH_RAMP_ACC * dtRamp;
-      vmaxCur = approachf(vmaxCur, PATH_VMAX_XY, rampMaxDelta);
-      float vCap = clampf(vmaxCur, 500.0f, PATH_VMAX_XY);
+      // AutoTune may inject speed/accel overrides; 0 means use firmware defaults.
+      float pathRampAcc = (g_overrideAccel > 0.0f) ? g_overrideAccel : PATH_RAMP_ACC;
+      float pathVmax    = (g_overrideVmax  > 0.0f) ? g_overrideVmax  : PATH_VMAX_XY;
+      float pathMinV = PATH_MIN_VXY;
+
+      float rampMaxDelta = pathRampAcc * dtRamp;
+      vmaxCur = approachf(vmaxCur, pathVmax, rampMaxDelta);
+      float vCap = clampf(vmaxCur, 500.0f, pathVmax);
 
       const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
       const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);
 
       if (!xDone || !yDone) {
-        float minPathV = PATH_MIN_VXY;
+        float minPathV = pathMinV;
         if (!xDone && !yDone) {
           vCap *= 0.35f;
           minPathV *= 0.5f;
@@ -307,9 +312,12 @@ static void stepTask(void *param) {
       }
       prevUsRamp = nowUs;
 
-      float rampMaxDelta = RECENTER_RAMP_ACC * dtRamp;
-      vmaxCur = approachf(vmaxCur, RECENTER_VMAX_XY, rampMaxDelta);
-      float vCap = clampf(vmaxCur, 400.0f, RECENTER_VMAX_XY);
+      // AutoTune may inject overrides; 0 means use firmware defaults.
+      float activeVmax  = (g_overrideVmax  > 0.0f) ? g_overrideVmax  : RECENTER_VMAX_XY;
+      float activeAccel = (g_overrideAccel > 0.0f) ? g_overrideAccel : RECENTER_RAMP_ACC;
+      float rampMaxDelta = activeAccel * dtRamp;
+      vmaxCur = approachf(vmaxCur, activeVmax, rampMaxDelta);
+      float vCap = clampf(vmaxCur, 400.0f, activeVmax);
 
       const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
       const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);

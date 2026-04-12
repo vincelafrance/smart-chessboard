@@ -86,6 +86,33 @@ volatile bool g_autoMagnetPath = false;
 volatile bool g_autoCalibRequested = false;
 volatile bool g_autoCalibStarted   = false;
 
+// System state
+volatile SystemState g_systemState = SYS_UNHOMED;
+
+// AutoTune
+volatile TunePhase g_tunePhase    = AT_PHASE_IDLE;
+volatile int       g_tuneProgress = 0;
+volatile bool      g_tuneActive   = false;
+volatile bool      g_tuneAbortReq = false;
+
+TuneSettings g_tuneSettings = {
+    /* safeSpeed    */ 8600.0f,
+    /* safeAccel    */ 6000.0f,
+    /* motorCurrent */ 850,
+    /* tuningValid  */ false,
+    /* boundsValid  */ false,
+};
+
+volatile float g_overrideVmax  = 0.0f;
+volatile float g_overrideAccel = 0.0f;
+
+DriftRecord     g_driftLog[MAX_DRIFT_LOG];
+volatile uint8_t g_driftCount = 0;
+
+AtLogEntry       g_atLogBuf[AT_LOG_SLOTS];
+volatile uint8_t g_atLogWr = 0;
+volatile uint8_t g_atLogRd = 0;
+
 void initGlobals() {
   portENTER_CRITICAL(&gMux);
 

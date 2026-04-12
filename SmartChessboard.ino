@@ -10,6 +10,7 @@
 #include "StepTask.h"
 #include "MotionCoreXY.h"
 #include "DriversUART.h"
+#include "AutoTune.h"
 
 unsigned long lastBattMs = 0;
 unsigned long lastPushMs = 0;
@@ -70,6 +71,10 @@ void setup() {
   else { Serial.print("  http://"); Serial.println(WiFi.localIP()); }
 
   stepTaskStart();
+
+  // Load NVS-persisted tune settings and apply them to the motion system.
+  // Must come after initDriversUART() so setCurrentOverrides() has a driver.
+  autoTuneInit();
 }
 
 void loop() {
@@ -86,6 +91,9 @@ void loop() {
 
   // Hall poll + calibration sequencing
   calibrationLoop(now);
+
+  // AutoTune log drain + system-state tracking
+  autoTuneLoop(now);
 
   // Execute queued move requests once motion is idle.
   commandsLoop();

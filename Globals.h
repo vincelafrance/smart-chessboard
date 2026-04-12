@@ -262,6 +262,79 @@ extern volatile bool g_autoCalibRequested;
 extern volatile bool g_autoCalibStarted;
 
 // =======================================================
+// System state machine
+// =======================================================
+enum SystemState : uint8_t {
+    SYS_UNHOMED    = 0,   // boot — no calibration yet
+    SYS_CALIBRATING = 1,  // calibration sequence in progress
+    SYS_HOMED      = 2,   // calibrated but tuning not yet run
+    SYS_READY      = 3,   // calibrated (+ optionally tuned) — normal ops
+    SYS_TUNING     = 4,   // AutoTune task running
+    SYS_ERROR      = 5,   // unrecoverable fault
+};
+extern volatile SystemState g_systemState;
+
+// =======================================================
+// AutoTune phase
+// =======================================================
+enum TunePhase : uint8_t {
+    AT_PHASE_IDLE         = 0,
+    AT_PHASE_REFERENCE    = 1,
+    AT_PHASE_REPEATABILITY= 2,
+    AT_PHASE_SPEED_RAMP   = 3,
+    AT_PHASE_ACCEL_RAMP   = 4,
+    AT_PHASE_CURRENT      = 5,
+    AT_PHASE_APPROACH     = 6,
+    AT_PHASE_DONE         = 7,
+    AT_PHASE_ABORTED      = 8,
+    AT_PHASE_ERROR        = 9,
+};
+extern volatile TunePhase g_tunePhase;
+extern volatile int       g_tuneProgress;   // 0-100
+extern volatile bool      g_tuneActive;
+extern volatile bool      g_tuneAbortReq;
+
+// =======================================================
+// Tuning settings (loaded from NVS at boot)
+// =======================================================
+struct TuneSettings {
+    float    safeSpeed;      // validated safe recenter/path speed (steps/s)
+    float    safeAccel;      // validated safe acceleration (steps/s²)
+    uint16_t motorCurrent;   // validated cruise current (mA)
+    bool     tuningValid;    // true if a complete tune was saved
+    bool     boundsValid;    // true if bounds were confirmed by tuning
+};
+extern TuneSettings g_tuneSettings;
+
+// =======================================================
+// Motion overrides (set by AutoTune; 0 = use firmware defaults)
+// Checked by StepTask in both recenter and path sections.
+// =======================================================
+extern volatile float g_overrideVmax;    // max velocity override (steps/s)
+extern volatile float g_overrideAccel;   // acceleration override (steps/s²)
+
+// =======================================================
+// Drift log
+// =======================================================
+struct DriftRecord {
+    float driftX;
+    float driftY;
+};
+static const uint8_t MAX_DRIFT_LOG = 8;
+extern DriftRecord g_driftLog[MAX_DRIFT_LOG];
+extern volatile uint8_t g_driftCount;
+
+// =======================================================
+// AutoTune log ring-buffer (drained to WebSocket by autoTuneLoop)
+// =======================================================
+static const uint8_t AT_LOG_SLOTS   = 8;
+static const uint8_t AT_LOG_MSG_LEN = 110;
+struct AtLogEntry { char msg[AT_LOG_MSG_LEN]; };
+extern AtLogEntry       g_atLogBuf[AT_LOG_SLOTS];
+extern volatile uint8_t g_atLogWr;   // writer index (AutoTune task)
+extern volatile uint8_t g_atLogRd;   // reader index (loop / autoTuneLoop)
+
+// =======================================================
 // Global init
 // =======================================================
 void initGlobals();

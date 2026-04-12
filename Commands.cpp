@@ -5,6 +5,7 @@
 #include "Calibration.h"
 #include "BoardMapping.h"
 #include "MotionCoreXY.h"
+#include "AutoTune.h"
 
 enum PendingMoveType : uint8_t {
   PM_SQUARE = 0,
@@ -29,14 +30,17 @@ static uint8_t g_pendingTail = 0;
 static uint8_t g_pendingCount = 0;
 
 static bool isMotionBusy() {
+  // AutoTune holds exclusive motion control for the duration of its task.
+  if (g_tuneActive) return true;
+
   CalibState calib;
   bool recenter;
   bool path;
 
   portENTER_CRITICAL(&gMux);
-  calib = g_calibState;
+  calib    = g_calibState;
   recenter = g_recenter;
-  path = g_pathActive;
+  path     = g_pathActive;
   portEXIT_CRITICAL(&gMux);
 
   return (calib != CALIB_IDLE) || recenter || path;
@@ -180,7 +184,44 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   }
 
   if (strcmp(cmd, "calibAll") == 0) {
+    // Guard: refuse to start calibration while AutoTune holds the motion bus.
+    if (g_tuneActive) {
+      Serial.println("[CMD] calibAll ignored — AutoTune is running");
+      return;
+    }
     startFullCalibration();
+    return;
+  }
+
+  // { "cmd": "start_tuning", "mode": "full" | "quick" }
+  if (strcmp(cmd, "start_tuning") == 0) {
+    const char* mode = doc["mode"] | "full";
+    bool fullMode = (strcmp(mode, "quick") != 0);
+    if (!autoTuneStart(fullMode)) {
+      Serial.println("[CMD] start_tuning rejected (busy or no calib)");
+    }
+    return;
+  }
+
+  // { "cmd": "stop" }
+  // Emergency stop: halts motion and aborts any running AutoTune.
+  if (strcmp(cmd, "stop") == 0) {
+    autoTuneStop();
+    clearPendingMoves();
+    abortPath();
+    portENTER_CRITICAL(&gMux);
+    g_recenter = false;
+    g_vx_xy    = 0.0f;
+    g_vy_xy    = 0.0f;
+    g_lastCmdMs = millis();
+    portEXIT_CRITICAL(&gMux);
+    Serial.println("[CMD] STOP — motion halted, tune aborted if running");
+    return;
+  }
+
+  // { "cmd": "status" }
+  // Telemetry push handles status; this just acknowledges receipt.
+  if (strcmp(cmd, "status") == 0) {
     return;
   }
 

@@ -42,7 +42,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
     code{background:#0e1522;border:1px solid #1f2a3a;border-radius:10px;padding:2px 8px}
     #magnetBtn.active{background:#1dd1a1;color:#000;border-color:#1dd1a1}
     #calibBtn.active{background:#1dd1a1;color:#000;border-color:#1dd1a1}
-
     .dot{width:14px;height:14px;border-radius:999px;display:inline-block;background:#ff4d4d;box-shadow:0 0 0 3px rgba(255,77,77,.15);margin-right:8px;vertical-align:middle;}
     .dot.on{background:#1dd1a1;box-shadow:0 0 0 3px rgba(29,209,161,.15);}
     .inline{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap;font-size:13px;opacity:.9;}
@@ -182,6 +181,45 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
           <button class="mini" id="calibBtn">🎯 Calibration</button>
           <button class="mini" id="diag4Btn">🧭 Test 1-2-3-4</button>
           <button class="mini" id="magnetBtn">🧲 Electroaimant: OFF</button>
+          <button class="mini" id="tuneBtn">⚙️ Auto Tune</button>
+          <button class="mini" id="tuneQuickBtn">⚡ Quick Tune</button>
+          <button class="mini" id="tuneStopBtn" style="display:none;">🛑 Stop Tune</button>
+        </div>
+
+        <div id="tuneCard" style="display:none;margin-top:10px;padding:10px;background:#0e1522;border:1px solid #1f2a3a;border-radius:14px;">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <span style="font-weight:700;font-size:13px;">⚙️ Auto Tune</span>
+            <span id="tunePhaseTxt" style="font-size:12px;opacity:.8;">—</span>
+            <span id="tunePctTxt" style="font-size:12px;font-weight:700;color:#54a0ff;">0%</span>
+          </div>
+          <div class="bar" style="margin-top:8px;">
+            <div class="fill" id="tuneFill" style="background:linear-gradient(90deg,#54a0ff,#1dd1a1);"></div>
+          </div>
+          <div id="tuneLog" style="margin-top:8px;font-size:11px;font-family:monospace;opacity:.85;max-height:100px;overflow-y:auto;white-space:pre-wrap;background:#060a10;padding:6px 8px;border-radius:8px;border:1px solid #1f2a3a;"></div>
+        </div>
+
+        <div id="tuneResultCard" style="margin-top:10px;padding:10px;background:#0e1522;border:1px solid #1f2a3a;border-radius:14px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+            <span style="font-weight:700;font-size:13px;">💾 Réglages enregistrés</span>
+            <span id="tuneValidBadge" style="font-size:11px;padding:3px 10px;border-radius:999px;background:#1f2a3a;color:#888;border:1px solid #2a3a4a;">Non calibré</span>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Vitesse max</div>
+              <div class="val" id="tuneSpdVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Accélération</div>
+              <div class="val" id="tuneAccVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s²</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Courant moteur</div>
+              <div class="val" id="tuneCurrVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">mA</div>
+            </div>
+          </div>
         </div>
 
         <div class="pos">
@@ -236,12 +274,53 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   const bNorm = document.getElementById("spNorm");
   const bFast = document.getElementById("spFast");
 
-  const magnetBtn = document.getElementById("magnetBtn");
-  const calibBtn = document.getElementById("calibBtn");
-  const diag4Btn = document.getElementById("diag4Btn");
-  const boardWrapEl = document.getElementById("boardWrap");
-  let magnetOn = false;
+  const magnetBtn    = document.getElementById("magnetBtn");
+  const calibBtn     = document.getElementById("calibBtn");
+  const diag4Btn     = document.getElementById("diag4Btn");
+  const tuneBtn      = document.getElementById("tuneBtn");
+  const tuneQuickBtn = document.getElementById("tuneQuickBtn");
+  const tuneStopBtn  = document.getElementById("tuneStopBtn");
+  const tuneCard      = document.getElementById("tuneCard");
+  const tunePhaseTxt  = document.getElementById("tunePhaseTxt");
+  const tunePctTxt    = document.getElementById("tunePctTxt");
+  const tuneFill      = document.getElementById("tuneFill");
+  const tuneLogEl     = document.getElementById("tuneLog");
+  const boardWrapEl   = document.getElementById("boardWrap");
+  const tuneValidBadge = document.getElementById("tuneValidBadge");
+  const tuneSpdVal    = document.getElementById("tuneSpdVal");
+  const tuneAccVal    = document.getElementById("tuneAccVal");
+  const tuneCurrVal   = document.getElementById("tuneCurrVal");
+  let magnetOn  = false;
   let calibBusy = false;
+  let tuneBusy  = false;
+
+  const TUNE_PHASE_NAMES = [
+    "Idle","Référence","Répétabilité","Rampe vitesse",
+    "Rampe accél","Courant moteur","Approche",
+    "Terminé ✅","Annulé","Erreur ❌"
+  ];
+
+  function updateTuneUI(tuning, phase, pct) {
+    tuneBusy = !!tuning;
+    tuneCard.style.display = tuneBusy ? "block" : "none";
+    tuneBtn.style.display      = tuneBusy ? "none" : "";
+    tuneQuickBtn.style.display = tuneBusy ? "none" : "";
+    tuneStopBtn.style.display  = tuneBusy ? "" : "none";
+    if (tuneBusy || phase >= 7) {  // also show card for done/abort/error
+      tuneCard.style.display = "block";
+    }
+    const name = TUNE_PHASE_NAMES[phase] || "—";
+    tunePhaseTxt.textContent = name;
+    tunePctTxt.textContent   = pct + "%";
+    tuneFill.style.width     = pct + "%";
+    tuneBtn.classList.toggle("active", false);
+  }
+
+  function appendTuneLog(msg) {
+    if (!tuneLogEl) return;
+    tuneLogEl.textContent += msg + "\n";
+    tuneLogEl.scrollTop = tuneLogEl.scrollHeight;
+  }
 
   function setStatus(msg, ok=true){
     statusEl.textContent = msg;
@@ -261,6 +340,26 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
     calibBtn.classList.toggle("active", active);
     calibBtn.textContent = active ? "🎯 Calibration..." : "🎯 Calibration";
     if(boardWrapEl) boardWrapEl.classList.toggle("calibrating", calibBusy);
+  }
+
+  function updateTuneResultCard(valid, spd, acc, curr) {
+    if (valid) {
+      tuneValidBadge.textContent = "✅ Valide — NVS";
+      tuneValidBadge.style.background = "rgba(29,209,161,0.15)";
+      tuneValidBadge.style.color      = "#1dd1a1";
+      tuneValidBadge.style.border     = "1px solid rgba(29,209,161,0.4)";
+      tuneSpdVal.textContent  = Math.round(spd);
+      tuneAccVal.textContent  = Math.round(acc);
+      tuneCurrVal.textContent = curr;
+    } else {
+      tuneValidBadge.textContent = "Non calibré";
+      tuneValidBadge.style.background = "#1f2a3a";
+      tuneValidBadge.style.color      = "#888";
+      tuneValidBadge.style.border     = "1px solid #2a3a4a";
+      tuneSpdVal.textContent  = "—";
+      tuneAccVal.textContent  = "—";
+      tuneCurrVal.textContent = "—";
+    }
   }
 
   const wsUrl = `ws://${location.hostname}:81/`;
@@ -1333,8 +1432,27 @@ const pid = boardState[key];
         if (typeof d.hallY !== "undefined") updateHallUI(hallYDot, hallYText, !!d.hallY);
         if (typeof d.hallX !== "undefined") updateHallUI(hallXDot, hallXText, !!d.hallX);
         if (typeof d.calib !== "undefined") updateCalibUI(!!d.calib);
-        if (typeof d.busy !== "undefined") fwBusy = !!d.busy;
+        if (typeof d.busy  !== "undefined") fwBusy    = !!d.busy;
         if (typeof d.pending !== "undefined") fwPending = (d.pending|0);
+        // AutoTune telemetry
+        if (typeof d.tuning !== "undefined") {
+          updateTuneUI(!!d.tuning,
+                       typeof d.tunePhase === "number" ? d.tunePhase : 0,
+                       typeof d.tunePct   === "number" ? d.tunePct   : 0);
+        }
+        // Saved tune settings card
+        if (typeof d.tuneValid !== "undefined") {
+          updateTuneResultCard(
+            !!d.tuneValid,
+            typeof d.tuneSpd  === "number" ? d.tuneSpd  : 0,
+            typeof d.tuneAcc  === "number" ? d.tuneAcc  : 0,
+            typeof d.tuneCurr === "number" ? d.tuneCurr : 0
+          );
+        }
+        // Tune log messages arrive as a separate frame type
+        if (d.type === "tuneLog" && typeof d.msg === "string") {
+          appendTuneLog(d.msg);
+        }
         runPhysicalResetPump();
       } catch(e) {}
     };
@@ -1355,6 +1473,24 @@ const pid = boardState[key];
   calibBtn.addEventListener("click", ()=>{
     stopHold();
     send({cmd:"calibAll"});
+  });
+
+  tuneBtn.addEventListener("click", ()=>{
+    stopHold();
+    if(tuneBusy){ return; }
+    tuneLogEl.textContent = "";
+    send({cmd:"start_tuning", mode:"full"});
+  });
+
+  tuneQuickBtn.addEventListener("click", ()=>{
+    stopHold();
+    if(tuneBusy){ return; }
+    tuneLogEl.textContent = "";
+    send({cmd:"start_tuning", mode:"quick"});
+  });
+
+  tuneStopBtn.addEventListener("click", ()=>{
+    send({cmd:"stop"});
   });
 
   magnetBtn.addEventListener("click", ()=>{
@@ -1421,36 +1557,56 @@ void webPushTelemetry() {
   uint8_t pending;
 
   portENTER_CRITICAL(&gMux);
-  v = g_battV;
-  i = g_battI;
-  pct = g_battPct;
-  xAbs = g_xAbs;
-  yAbs = g_yAbs;
+  v     = g_battV;
+  i     = g_battI;
+  pct   = g_battPct;
+  xAbs  = g_xAbs;
+  yAbs  = g_yAbs;
   cxAbs = g_xCenterTarget;
   cyAbs = g_yCenterTarget;
-  sp = (uint8_t)g_speedMode;
+  sp    = (uint8_t)g_speedMode;
   magOn = g_magnetOn;
   hallY = g_hallYDetected;
   hallX = g_hallXDetected;
   calib = (g_calibState != CALIB_IDLE);
   portEXIT_CRITICAL(&gMux);
 
+  // AutoTune state (volatile reads — no lock needed for single-word values)
+  bool     tuning     = g_tuneActive;
+  uint8_t  tunePh     = (uint8_t)g_tunePhase;
+  int      tunePct    = g_tuneProgress;
+  uint8_t  sysState   = (uint8_t)g_systemState;
+  bool     tuneValid  = g_tuneSettings.tuningValid;
+  float    tuneSpd    = g_tuneSettings.safeSpeed;
+  float    tuneAcc    = g_tuneSettings.safeAccel;
+  uint16_t tuneCurr   = g_tuneSettings.motorCurrent;
+
   long xDisp = xAbs - cxAbs;
   long yDisp = yAbs - cyAbs;
-  busy = commandsIsBusy();
+  busy    = commandsIsBusy();
   pending = commandsPendingCount();
 
-  char msg[520];
+  char msg[640];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
-           "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,\"busy\":%s,\"pending\":%u}",
+           "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,"
+           "\"busy\":%s,\"pending\":%u,"
+           "\"sysState\":%u,\"tuning\":%s,\"tunePhase\":%u,\"tunePct\":%d,"
+           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneAcc\":%.0f,\"tuneCurr\":%u}",
            pct, v, i, xDisp, yDisp, (unsigned)sp,
-           (magOn ? "true" : "false"),
-           (hallY ? "true" : "false"),
-           (hallX ? "true" : "false"),
-           (calib ? "true" : "false"),
-           (busy ? "true" : "false"),
-           (unsigned)pending);
+           (magOn     ? "true" : "false"),
+           (hallY     ? "true" : "false"),
+           (hallX     ? "true" : "false"),
+           (calib     ? "true" : "false"),
+           (busy      ? "true" : "false"),
+           (unsigned)pending,
+           (unsigned)sysState,
+           (tuning    ? "true" : "false"),
+           (unsigned)tunePh,
+           tunePct,
+           (tuneValid ? "true" : "false"),
+           tuneSpd, tuneAcc,
+           (unsigned)tuneCurr);
 
   webSocket.broadcastTXT(msg);
 }

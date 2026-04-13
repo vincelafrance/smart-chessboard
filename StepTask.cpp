@@ -12,14 +12,15 @@ static void stepTask(void *param) {
 
   uint32_t lastA = micros();
   uint32_t lastB = micros();
+  uint32_t prevUs = lastA;
 
   float vA_cur = 0.0f;
   float vB_cur = 0.0f;
 
   unsigned long settleStartMs = 0;
-  float vmaxCur = 0.0f;
-  uint32_t prevUsRamp = 0;
-  static uint32_t prevUs = 0;
+  bool prevCalibY = false;
+  bool prevCalibX = false;
+  bool prevRecenter = false;
   static bool pickupWaitActive = false;
   static unsigned long pickupWaitStartMs = 0;
   static uint8_t pickupWaitWpIdx = 255;
@@ -27,6 +28,15 @@ static void stepTask(void *param) {
   for (;;) {
     uint32_t nowUs = micros();
     unsigned long nowMs = millis();
+
+    float dt = 0.001f;
+    if (prevUs != 0) {
+      uint32_t du = (uint32_t)(nowUs - prevUs);
+      dt = (float)du / 1000000.0f;
+      if (dt < 0.00005f) dt = 0.00005f;
+      if (dt > 0.01f)    dt = 0.01f;
+    }
+    prevUs = nowUs;
 
     long Apos, Bpos;
     portENTER_CRITICAL(&gMux);
@@ -39,6 +49,7 @@ static void stepTask(void *param) {
 
     CalibState calibState;
     float vx, vy;
+    float overrideAccel;
     bool recenter;
     bool pathActive;
     long pathTx, pathTy;
@@ -48,6 +59,7 @@ static void stepTask(void *param) {
     calibState = g_calibState;
     vx = g_vx_xy;
     vy = g_vy_xy;
+    overrideAccel = g_overrideAccel;
     recenter = g_recenter;
     pathActive = g_pathActive;
     pathTx = g_pathTargetX;
@@ -57,6 +69,15 @@ static void stepTask(void *param) {
 
     const bool calibY = (calibState == CALIB_Y_BOTTOM || calibState == CALIB_Y_TOP);
     const bool calibX = (calibState == CALIB_X_BOTTOM || calibState == CALIB_X_TOP);
+
+    // When calibration hands off to recenter, discard any residual motor
+    // velocity from the previous seek phase so the carriage starts the
+    // Y-then-X recenter cleanly instead of briefly blending into a diagonal.
+    if (recenter && !prevRecenter && (prevCalibY || prevCalibX)) {
+      vA_cur = 0.0f;
+      vB_cur = 0.0f;
+      settleStartMs = 0;
+    }
 
     long xMin, xMax, yMin, yMax;
     getXLimits(xMin, xMax);
@@ -96,51 +117,80 @@ static void stepTask(void *param) {
       vx_t = 0.0f;
       float dirY = (calibState == CALIB_Y_TOP) ? -(float)CALIB_Y_DIR : (float)CALIB_Y_DIR;
       vy_t = dirY * CALIB_Y_SPEED;
-      vmaxCur = 0.0f; prevUsRamp = 0; settleStartMs = 0;
+      settleStartMs = 0;
     }
     else if (calibX) {
+      // Appliquer un taper sur la vitesse minimale et la capabilité près du centre pour éviter les coups.
+      long xTarget = (calibState == CALIB_X_TOP) ? xMax : xMin;
+      long ex = xTarget - xAbs;
+      long exAbs = labs(ex);
       float dirX = (calibState == CALIB_X_TOP) ? -(float)CALIB_X_DIR : (float)CALIB_X_DIR;
-      vx_t = dirX * CALIB_X_SPEED;
+      float vCapX = fmaxf(180.0f, CALIB_X_SPEED * 1.0f); // vCapX = CALIB_X_SPEED, mais on garde la structure pour le taper
+      float minVX = CALIB_X_SPEED * 0.5f; // minVX = 50% de la vitesse de calibration
+
+      // Taper près du centre (même logique que recentrage)
+      if (exAbs < 120) {
+        float t = clampf((float)exAbs / 120.0f, 0.0f, 1.0f);
+        const float minVXNear = 40.0f; // plus doux que recentrage
+        minVX = minVXNear + (minVX - minVXNear) * t;
+        vCapX = fmaxf(100.0f, vCapX * (0.45f + 0.55f * t));
+      }
+
+      vx_t = clampf(dirX * CALIB_X_SPEED, -vCapX, +vCapX);
+      if (fabs(vx_t) > 0.0f && fabs(vx_t) < minVX && exAbs > 2 * RECENTER_DEADBAND_XY) {
+        vx_t = (vx_t > 0) ? minVX : -minVX;
+      }
       vy_t = 0.0f;
-      vmaxCur = 0.0f; prevUsRamp = 0; settleStartMs = 0;
+      settleStartMs = 0;
     }
     else if (pathActive) {
       long ex = pathTx - xAbs;
       long ey = pathTy - yAbs;
 
-      float dtRamp = 0.001f;
-      if (prevUsRamp != 0) {
-        uint32_t du = (uint32_t)(nowUs - prevUsRamp);
-        dtRamp = (float)du / 1000000.0f;
-        if (dtRamp < 0.00005f) dtRamp = 0.00005f;
-        if (dtRamp > 0.02f)    dtRamp = 0.02f;
+      // AutoTune may inject a speed override; 0 means use firmware default.
+      float pathVmax = (g_overrideVmax > 0.0f) ? g_overrideVmax : PATH_VMAX_XY;
+
+      // Blend between axis speed and diagonal speed based on movement direction.
+      // In CoreXY a 45° XY diagonal = one motor at √2× carriage speed (other idle).
+      // diagFrac: 0.0 = pure axis (both motors equal), 1.0 = pure 45° diagonal (one motor).
+      // Applies only when both overrides are set to distinct values.
+      if (g_overrideVmax > 0.0f && g_overrideDiagVmax > 0.0f &&
+          g_overrideDiagVmax != g_overrideVmax) {
+          float ex_f = (float)(pathTx - xAbs);
+          float ey_f = (float)(pathTy - yAbs);
+          float eMag = fmaxf(fabsf(ex_f), fabsf(ey_f));
+          if (eMag > 50.0f) {
+              // Motor A speed ∝ |ex+ey|, motor B speed ∝ |ex-ey|
+              float mA = fabsf(ex_f + ey_f);
+              float mB = fabsf(ex_f - ey_f);
+              float hi = fmaxf(mA, mB);
+              float lo = fminf(mA, mB);
+              float sum = hi + lo;
+              float diagFrac = (sum > 0.0f) ? ((hi - lo) / sum) : 0.0f;
+              pathVmax = g_overrideVmax + diagFrac * (g_overrideDiagVmax - g_overrideVmax);
+          }
       }
-      prevUsRamp = nowUs;
-
-      // AutoTune may inject speed/accel overrides; 0 means use firmware defaults.
-      float pathRampAcc = (g_overrideAccel > 0.0f) ? g_overrideAccel : PATH_RAMP_ACC;
-      float pathVmax    = (g_overrideVmax  > 0.0f) ? g_overrideVmax  : PATH_VMAX_XY;
       float pathMinV = PATH_MIN_VXY;
-
-      float rampMaxDelta = pathRampAcc * dtRamp;
-      vmaxCur = approachf(vmaxCur, pathVmax, rampMaxDelta);
-      float vCap = clampf(vmaxCur, 500.0f, pathVmax);
+      float vCap = pathVmax;
 
       const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
       const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);
 
       if (!xDone || !yDone) {
         float minPathV = pathMinV;
+        const float errMag = fmaxf(fabsf((float)ex), fabsf((float)ey));
         if (!xDone && !yDone) {
-          vCap *= 0.35f;
-          minPathV *= 0.5f;
+          // Only soften diagonals close to the target; keep long traversals snappy.
+          if (errMag < 220.0f) {
+            vCap *= 0.55f;
+            minPathV *= 0.65f;
+          }
         }
 
         // Taper minimum speed near target to reduce end-of-diagonal bounce.
-        const float errMag = fmaxf(fabsf((float)ex), fabsf((float)ey));
-        if (errMag < 180.0f) {
-          float t = clampf(errMag / 180.0f, 0.0f, 1.0f);
-          const float minNear = 70.0f;
+        if (errMag < 80.0f) {
+          float t = clampf(errMag / 80.0f, 0.0f, 1.0f);
+          const float minNear = 120.0f;
           minPathV = minNear + (minPathV - minNear) * t;
         }
 
@@ -154,8 +204,8 @@ static void stepTask(void *param) {
         vx_t = vx_raw * scale;
         vy_t = vy_raw * scale;
 
-        const bool xVeryNear = (labs(ex) <= (RECENTER_DEADBAND_XY * 2));
-        const bool yVeryNear = (labs(ey) <= (RECENTER_DEADBAND_XY * 2));
+        const bool xVeryNear = (labs(ex) <= RECENTER_DEADBAND_XY);
+        const bool yVeryNear = (labs(ey) <= RECENTER_DEADBAND_XY);
 
         if (!xDone && !xVeryNear && fabsf(vx_t) < minPathV) vx_t = (ex >= 0) ? minPathV : -minPathV;
         if (!yDone && !yVeryNear && fabsf(vy_t) < minPathV) vy_t = (ey >= 0) ? minPathV : -minPathV;
@@ -283,10 +333,6 @@ static void stepTask(void *param) {
           portEXIT_CRITICAL(&gMux);
 
           settleStartMs = 0;
-          if (isFinalWp) {
-            vmaxCur = 0.0f;
-            prevUsRamp = 0;
-          }
         }
 
         vx_t = 0.0f;
@@ -303,21 +349,9 @@ static void stepTask(void *param) {
       long ex = xT - xAbs;
       long ey = yT - yAbs;
 
-      float dtRamp = 0.001f;
-      if (prevUsRamp != 0) {
-        uint32_t du = (uint32_t)(nowUs - prevUsRamp);
-        dtRamp = (float)du / 1000000.0f;
-        if (dtRamp < 0.00005f) dtRamp = 0.00005f;
-        if (dtRamp > 0.02f)    dtRamp = 0.02f;
-      }
-      prevUsRamp = nowUs;
-
-      // AutoTune may inject overrides; 0 means use firmware defaults.
-      float activeVmax  = (g_overrideVmax  > 0.0f) ? g_overrideVmax  : RECENTER_VMAX_XY;
-      float activeAccel = (g_overrideAccel > 0.0f) ? g_overrideAccel : RECENTER_RAMP_ACC;
-      float rampMaxDelta = activeAccel * dtRamp;
-      vmaxCur = approachf(vmaxCur, activeVmax, rampMaxDelta);
-      float vCap = clampf(vmaxCur, 400.0f, activeVmax);
+      // AutoTune may inject a speed override; 0 means use firmware default.
+      float activeVmax = (g_overrideVmax > 0.0f) ? g_overrideVmax : RECENTER_VMAX_XY;
+      float vCap = activeVmax;
 
       const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
       const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);
@@ -329,9 +363,26 @@ static void stepTask(void *param) {
         settleStartMs = 0;
       } else if (!xDone) {
         vy_t = 0.0f;
-        float vCapX = fmaxf(180.0f, vCap * RECENTER_X_CAP_SCALE);
-        vx_t = clampf(RECENTER_KP * (float)ex, -vCapX, +vCapX);
-        if (fabs(vx_t) > 0.0f && fabs(vx_t) < RECENTER_X_MIN_VXY) vx_t = (vx_t > 0) ? RECENTER_X_MIN_VXY : -RECENTER_X_MIN_VXY;
+        long exAbs = labs(ex);
+        float vCapX = fmaxf(140.0f, vCap * 0.42f);
+        float minVX = 110.0f;
+        float kpX = 1.15f;
+
+        // Soften the Y->X handoff and the final X approach. On CoreXY the X-only
+        // segment asks one motor to reverse while the other keeps moving, which
+        // is where the carriage most easily feels "kicky".
+        if (exAbs < 220) {
+          float t = clampf((float)exAbs / 220.0f, 0.0f, 1.0f);
+          const float minVXNear = 45.0f;
+          minVX = minVXNear + (minVX - minVXNear) * t;
+          vCapX = fmaxf(90.0f, vCapX * (0.30f + 0.70f * t));
+          kpX = 0.70f + (kpX - 0.70f) * t;
+        }
+
+        vx_t = clampf(kpX * (float)ex, -vCapX, +vCapX);
+        if (fabs(vx_t) > 0.0f && fabs(vx_t) < minVX && exAbs > 80) {
+          vx_t = (vx_t > 0) ? minVX : -minVX;
+        }
         settleStartMs = 0;
       } else {
         if (settleStartMs == 0) settleStartMs = nowMs;
@@ -344,8 +395,6 @@ static void stepTask(void *param) {
           portEXIT_CRITICAL(&gMux);
 
           settleStartMs = 0;
-          vmaxCur = 0.0f;
-          prevUsRamp = 0;
         }
         vx_t = 0.0f;
         vy_t = 0.0f;
@@ -354,7 +403,7 @@ static void stepTask(void *param) {
     else {
       vx_t = vx;
       vy_t = vy;
-      vmaxCur = 0.0f; prevUsRamp = 0; settleStartMs = 0;
+      settleStartMs = 0;
     }
 
     long yMinUse, yMaxUse, xMinUse, xMaxUse;
@@ -367,30 +416,36 @@ static void stepTask(void *param) {
     float vA_t, vB_t;
     xyToAB(vx_t, vy_t, vA_t, vB_t);
 
-    float dt = 0.001f;
-    if (prevUs != 0) {
-      uint32_t du = (uint32_t)(nowUs - prevUs);
-      dt = (float)du / 1000000.0f;
-      if (dt < 0.00005f) dt = 0.00005f;
-      if (dt > 0.02f)    dt = 0.02f;
-    }
-    prevUs = nowUs;
 
-    float accelAB = ACCEL_AB;
-    if (pathActive) {
-      accelAB = PATH_ACCEL_AB;
-      const float aAbs = fabsf(vA_t);
-      const float bAbs = fabsf(vB_t);
-      const float hi = fmaxf(aAbs, bAbs);
-      const float lo = fminf(aAbs, bAbs);
-      if (hi > 200.0f && lo < (hi * PATH_DIAG_SINGLE_MOTOR_RATIO)) {
-        accelAB = PATH_ACCEL_AB_DIAG;
-      }
+    float rampUpRate = MOTION_RAMP_UP_AB;
+    if (overrideAccel > 0.0f) {
+      // AutoTune path/recenter uses overrideAccel; keep launches smoother than
+      // manual motion while still remaining responsive.
+      rampUpRate = clampf(overrideAccel * 3.5f, 22000.0f, MOTION_RAMP_UP_AB);
+    }
+    float rampDownRate = MOTION_RAMP_DOWN_AB;
+    if (g_overrideDecel > 0.0f) {
+      rampDownRate = clampf(g_overrideDecel * 3.5f, 22000.0f, MOTION_RAMP_DOWN_AB);
     }
 
-    float maxDv = accelAB * dt;
-    vA_cur = approachf(vA_cur, vA_t, maxDv);
-    vB_cur = approachf(vB_cur, vB_t, maxDv);
+    float rampStopRate = MOTION_RAMP_STOP_AB;
+    if (g_overrideDecel > 0.0f) {
+      // When AutoTune supplies a decel override, apply it to full stops too
+      // instead of letting the dedicated stop ramp hide the tuned behavior.
+      rampStopRate = clampf(g_overrideDecel * 3.5f, 22000.0f, MOTION_RAMP_STOP_AB);
+    }
+
+    const float accelUp = rampUpRate * dt;
+    const float accelDown = rampDownRate * dt;
+    const float accelStop = rampStopRate * dt;
+
+    float maxDeltaA = (fabsf(vA_t) <= 1.0f) ? accelStop :
+              ((fabsf(vA_t) >= fabsf(vA_cur) || (vA_cur * vA_t) < 0.0f) ? accelUp : accelDown);
+    float maxDeltaB = (fabsf(vB_t) <= 1.0f) ? accelStop :
+              ((fabsf(vB_t) >= fabsf(vB_cur) || (vB_cur * vB_t) < 0.0f) ? accelUp : accelDown);
+
+    vA_cur = approachf(vA_cur, vA_t, maxDeltaA);
+    vB_cur = approachf(vB_cur, vB_t, maxDeltaB);
 
     uint8_t ms = getDriversUARTMicrosteps();
     if (ms == 0) ms = 8;
@@ -413,6 +468,10 @@ static void stepTask(void *param) {
       markMotion();
       portEXIT_CRITICAL(&gMux);
     }
+
+    prevCalibY = calibY;
+    prevCalibX = calibX;
+    prevRecenter = recenter;
 
     if (DRIVERS_AUTO_DISABLE && !wantsMove) {
       unsigned long lastMot;

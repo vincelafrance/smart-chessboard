@@ -193,11 +193,9 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     return;
   }
 
-  // { "cmd": "start_tuning", "mode": "full" | "quick" }
+  // { "cmd": "start_tuning" }
   if (strcmp(cmd, "start_tuning") == 0) {
-    const char* mode = doc["mode"] | "full";
-    bool fullMode = (strcmp(mode, "quick") != 0);
-    if (!autoTuneStart(fullMode)) {
+    if (!autoTuneStart()) {
       Serial.println("[CMD] start_tuning rejected (busy or no calib)");
     }
     return;

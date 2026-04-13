@@ -24,11 +24,9 @@
 // Load saved TuneSettings from NVS at boot (before first move).
 void autoTuneInit();
 
-// Start the tuning sequence.  fullMode=true runs all 5 phases (Repeatability
-// + SpeedRamp + AccelRamp + CurrentTune + Approach).  fullMode=false runs a
-// reduced quick pass (fewer cycles per phase).
+// Start the tuning sequence (single mode — optimised for ~15 min runtime).
 // Returns false if already running or calibration is not valid.
-bool autoTuneStart(bool fullMode);
+bool autoTuneStart();
 
 // Request graceful abort.  Motion is stopped, overrides are cleared.
 void autoTuneStop();

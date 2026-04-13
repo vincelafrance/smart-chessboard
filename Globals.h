@@ -172,29 +172,28 @@ static const float SPEED_XY_SLOW   = 2000.0f;
 static const float SPEED_XY_NORMAL = 4500.0f;
 static const float SPEED_XY_FAST   = 8000.0f;
 
-// Accel
-static const float ACCEL_AB = 32000.0f;
-static const float PATH_ACCEL_AB = 14000.0f;
-static const float PATH_ACCEL_AB_DIAG = 2000.0f;
-static const float PATH_DIAG_SINGLE_MOTOR_RATIO = 0.35f;
-
 // Recenter / Path
 static const float RECENTER_KP = 2.0f;
 static const float RECENTER_VMAX_XY = 7000.0f;
-static const float RECENTER_RAMP_ACC = 9000.0f;
 static const float RECENTER_MIN_VXY = 350.0f;
 static const float RECENTER_X_CAP_SCALE = 0.55f;
 static const float RECENTER_X_MIN_VXY = 220.0f;
 static const long  RECENTER_DEADBAND_XY = 12;
-static const unsigned long RECENTER_SETTLE_MS = 120;
+static const unsigned long RECENTER_SETTLE_MS = 60;
 
 // Faster piece movement profile (independent from recenter calibration behavior)
 static const float PATH_VMAX_XY = 8600.0f;
-static const float PATH_RAMP_ACC = 6000.0f;
 static const float PATH_KP = 2.0f;
 static const float PATH_MIN_VXY = 380.0f;
-static const unsigned long PATH_SETTLE_MS = 70;
+static const unsigned long PATH_SETTLE_MS = 35;
 static const unsigned long PATH_PICKUP_SETTLE_MS = 180;
+
+// Global motor slew limiter.
+// Keep this very short so moves stay snappy while avoiding hard step jumps
+// at launch, stop, and direction reversals.
+static const float MOTION_RAMP_UP_AB   = 70000.0f;
+static const float MOTION_RAMP_DOWN_AB = 280000.0f;
+static const float MOTION_RAMP_STOP_AB = 900000.0f;
 
 // Auto disable
 static const bool DRIVERS_AUTO_DISABLE = true;
@@ -298,8 +297,10 @@ extern volatile bool      g_tuneAbortReq;
 // Tuning settings (loaded from NVS at boot)
 // =======================================================
 struct TuneSettings {
-    float    safeSpeed;      // validated safe recenter/path speed (steps/s)
+    float    safeSpeed;      // validated safe axis speed (steps/s) — straight lines
+    float    safeSpeedDiag;  // validated safe diagonal speed (steps/s) — 45° moves
     float    safeAccel;      // validated safe acceleration (steps/s²)
+    float    safeDecel;      // validated safe deceleration (steps/s²)
     uint16_t motorCurrent;   // validated cruise current (mA)
     bool     tuningValid;    // true if a complete tune was saved
     bool     boundsValid;    // true if bounds were confirmed by tuning
@@ -310,8 +311,15 @@ extern TuneSettings g_tuneSettings;
 // Motion overrides (set by AutoTune; 0 = use firmware defaults)
 // Checked by StepTask in both recenter and path sections.
 // =======================================================
-extern volatile float g_overrideVmax;    // max velocity override (steps/s)
-extern volatile float g_overrideAccel;   // acceleration override (steps/s²)
+extern volatile float g_overrideVmax;     // axis speed override (steps/s)
+extern volatile float g_overrideDiagVmax; // diagonal speed override (steps/s); 0 = same as g_overrideVmax
+extern volatile float g_overrideAccel;    // acceleration override (steps/s²)
+extern volatile float g_overrideDecel;    // deceleration override (steps/s²)
+extern volatile uint16_t g_tuneCurrentMa; // current level presently under test by AutoTune
+extern volatile float g_tuneLiveAxisSpeed; // Auto Tune axis speed presently being evaluated
+extern volatile float g_tuneLiveDiagSpeed; // Auto Tune diagonal speed presently being evaluated
+extern volatile float g_tuneLiveAccel;     // Auto Tune acceleration presently being evaluated
+extern volatile float g_tuneLiveDecel;     // Auto Tune deceleration presently being evaluated
 
 // =======================================================
 // Drift log

@@ -64,6 +64,7 @@ void setup() {
 
   // WiFi + Web
   startWiFi();
+  initOTA();
   webInit();
 
   Serial.println("OK. Ouvre:");
@@ -78,6 +79,7 @@ void setup() {
 }
 
 void loop() {
+  handleOTA();
   webLoop();
 
   const unsigned long now = millis();

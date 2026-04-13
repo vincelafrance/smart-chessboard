@@ -182,7 +182,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
           <button class="mini" id="diag4Btn">🧭 Test 1-2-3-4</button>
           <button class="mini" id="magnetBtn">🧲 Electroaimant: OFF</button>
           <button class="mini" id="tuneBtn">⚙️ Auto Tune</button>
-          <button class="mini" id="tuneQuickBtn">⚡ Quick Tune</button>
           <button class="mini" id="tuneStopBtn" style="display:none;">🛑 Stop Tune</button>
         </div>
 
@@ -203,15 +202,56 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             <span style="font-weight:700;font-size:13px;">💾 Réglages enregistrés</span>
             <span id="tuneValidBadge" style="font-size:11px;padding:3px 10px;border-radius:999px;background:#1f2a3a;color:#888;border:1px solid #2a3a4a;">Non calibré</span>
           </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+            <span style="font-weight:700;font-size:12px;">🧪 Réglages en cours de test</span>
+            <span id="tuneLiveBadge" style="font-size:11px;padding:3px 10px;border-radius:999px;background:#1f2a3a;color:#888;border:1px solid #2a3a4a;">Inactif</span>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Vit. axe</div>
+              <div class="val" id="liveTuneSpdVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Vit. diag</div>
+              <div class="val" id="liveTuneSpdDiagVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Accélération</div>
+              <div class="val" id="liveTuneAccVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s²</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Décélération</div>
+              <div class="val" id="liveTuneDecelVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s²</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Courant</div>
+              <div class="val" id="liveTuneCurrVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">mA</div>
+            </div>
+          </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <div class="pill" style="min-width:90px;">
-              <div class="label">Vitesse max</div>
+              <div class="label">Vit. lignes droites</div>
               <div class="val" id="tuneSpdVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Vit. diagonales</div>
+              <div class="val" id="tuneSpdDiagVal" style="font-size:16px;">—</div>
               <div class="label" style="margin-top:2px;">steps/s</div>
             </div>
             <div class="pill" style="min-width:90px;">
               <div class="label">Accélération</div>
               <div class="val" id="tuneAccVal" style="font-size:16px;">—</div>
+              <div class="label" style="margin-top:2px;">steps/s²</div>
+            </div>
+            <div class="pill" style="min-width:90px;">
+              <div class="label">Décélération</div>
+              <div class="val" id="tuneDecelVal" style="font-size:16px;">—</div>
               <div class="label" style="margin-top:2px;">steps/s²</div>
             </div>
             <div class="pill" style="min-width:90px;">
@@ -278,7 +318,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   const calibBtn     = document.getElementById("calibBtn");
   const diag4Btn     = document.getElementById("diag4Btn");
   const tuneBtn      = document.getElementById("tuneBtn");
-  const tuneQuickBtn = document.getElementById("tuneQuickBtn");
   const tuneStopBtn  = document.getElementById("tuneStopBtn");
   const tuneCard      = document.getElementById("tuneCard");
   const tunePhaseTxt  = document.getElementById("tunePhaseTxt");
@@ -287,32 +326,65 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   const tuneLogEl     = document.getElementById("tuneLog");
   const boardWrapEl   = document.getElementById("boardWrap");
   const tuneValidBadge = document.getElementById("tuneValidBadge");
-  const tuneSpdVal    = document.getElementById("tuneSpdVal");
-  const tuneAccVal    = document.getElementById("tuneAccVal");
-  const tuneCurrVal   = document.getElementById("tuneCurrVal");
-  let magnetOn  = false;
-  let calibBusy = false;
-  let tuneBusy  = false;
+  const tuneLiveBadge  = document.getElementById("tuneLiveBadge");
+  const tuneSpdVal     = document.getElementById("tuneSpdVal");
+  const tuneSpdDiagVal = document.getElementById("tuneSpdDiagVal");
+  const tuneAccVal     = document.getElementById("tuneAccVal");
+  const tuneDecelVal   = document.getElementById("tuneDecelVal");
+  const tuneCurrVal    = document.getElementById("tuneCurrVal");
+  const liveTuneSpdVal     = document.getElementById("liveTuneSpdVal");
+  const liveTuneSpdDiagVal = document.getElementById("liveTuneSpdDiagVal");
+  const liveTuneAccVal     = document.getElementById("liveTuneAccVal");
+  const liveTuneDecelVal   = document.getElementById("liveTuneDecelVal");
+  const liveTuneCurrVal    = document.getElementById("liveTuneCurrVal");
+  let magnetOn   = false;
+  let calibBusy  = false;
+  let tuneBusy   = false;
+  let tuneStartMs = null;
 
   const TUNE_PHASE_NAMES = [
     "Idle","Référence","Répétabilité","Rampe vitesse",
-    "Rampe accél","Courant moteur","Approche",
+    "—","Courant moteur","Vérification finale",
     "Terminé ✅","Annulé","Erreur ❌"
   ];
 
+  // [startPct, weightPct] for each TunePhase enum value (weights sum to 100)
+  const PHASE_SPANS = [
+    [0,   0],   // 0: IDLE
+    [0,   5],   // 1: REFERENCE
+    [5,  10],   // 2: REPEATABILITY
+    [15, 45],   // 3: SPEED_RAMP (diag + axis)
+    [60,  0],   // 4: ACCEL_RAMP (removed)
+    [60, 25],   // 5: CURRENT
+    [85, 15],   // 6: FINAL CHARACTERIZE
+    [100, 0],   // 7: DONE
+    [100, 0],   // 8: ABORTED
+    [100, 0],   // 9: ERROR
+  ];
+
+  function computeOverallPct(phase, phasePct) {
+    if (phase >= PHASE_SPANS.length) return 100;
+    const [start, weight] = PHASE_SPANS[phase];
+    return Math.round(start + weight * phasePct / 100);
+  }
+
   function updateTuneUI(tuning, phase, pct) {
     tuneBusy = !!tuning;
+
     tuneCard.style.display = tuneBusy ? "block" : "none";
-    tuneBtn.style.display      = tuneBusy ? "none" : "";
-    tuneQuickBtn.style.display = tuneBusy ? "none" : "";
-    tuneStopBtn.style.display  = tuneBusy ? "" : "none";
+    tuneBtn.style.display     = tuneBusy ? "none" : "";
+    tuneStopBtn.style.display = tuneBusy ? "" : "none";
     if (tuneBusy || phase >= 7) {  // also show card for done/abort/error
       tuneCard.style.display = "block";
     }
     const name = TUNE_PHASE_NAMES[phase] || "—";
     tunePhaseTxt.textContent = name;
-    tunePctTxt.textContent   = pct + "%";
-    tuneFill.style.width     = pct + "%";
+
+    // Affiche le pourcentage d'avancement, mais pas d'ETA/temps
+    const overallPct = computeOverallPct(phase, pct);
+    tunePctTxt.textContent = overallPct + "%";
+    tuneFill.style.width   = overallPct + "%";
+
     tuneBtn.classList.toggle("active", false);
   }
 
@@ -342,23 +414,73 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
     if(boardWrapEl) boardWrapEl.classList.toggle("calibrating", calibBusy);
   }
 
-  function updateTuneResultCard(valid, spd, acc, curr) {
+  let savedTuneCache = null;
+
+  function renderTuneResultCard(valid, spd, spdDiag, acc, decel, curr) {
     if (valid) {
       tuneValidBadge.textContent = "✅ Valide — NVS";
       tuneValidBadge.style.background = "rgba(29,209,161,0.15)";
       tuneValidBadge.style.color      = "#1dd1a1";
       tuneValidBadge.style.border     = "1px solid rgba(29,209,161,0.4)";
-      tuneSpdVal.textContent  = Math.round(spd);
-      tuneAccVal.textContent  = Math.round(acc);
-      tuneCurrVal.textContent = curr;
+      tuneSpdVal.textContent     = Math.round(spd);
+      tuneSpdDiagVal.textContent = Math.round(spdDiag);
+      tuneAccVal.textContent     = Math.round(acc);
+      tuneDecelVal.textContent   = Math.round(decel);
+      tuneCurrVal.textContent    = curr;
     } else {
       tuneValidBadge.textContent = "Non calibré";
       tuneValidBadge.style.background = "#1f2a3a";
       tuneValidBadge.style.color      = "#888";
       tuneValidBadge.style.border     = "1px solid #2a3a4a";
-      tuneSpdVal.textContent  = "—";
-      tuneAccVal.textContent  = "—";
-      tuneCurrVal.textContent = "—";
+      tuneSpdVal.textContent     = "—";
+      tuneSpdDiagVal.textContent = "—";
+      tuneAccVal.textContent     = "—";
+      tuneDecelVal.textContent   = "—";
+      tuneCurrVal.textContent    = "—";
+    }
+  }
+
+  function updateTuneResultCard(valid, spd, spdDiag, acc, decel, curr) {
+    if (valid) {
+      savedTuneCache = { spd, spdDiag, acc, decel, curr };
+      renderTuneResultCard(true, spd, spdDiag, acc, decel, curr);
+      return;
+    }
+
+    if (tuneBusy && savedTuneCache) {
+      renderTuneResultCard(true,
+        savedTuneCache.spd,
+        savedTuneCache.spdDiag,
+        savedTuneCache.acc,
+        savedTuneCache.decel,
+        savedTuneCache.curr);
+      return;
+    }
+
+    renderTuneResultCard(false, spd, spdDiag, acc, decel, curr);
+  }
+
+  function updateLiveTuneCard(active, spd, spdDiag, acc, decel, curr) {
+    if (active) {
+      tuneLiveBadge.textContent = "Actif";
+      tuneLiveBadge.style.background = "rgba(84,160,255,0.16)";
+      tuneLiveBadge.style.color      = "#54a0ff";
+      tuneLiveBadge.style.border     = "1px solid rgba(84,160,255,0.45)";
+      liveTuneSpdVal.textContent     = Math.round(spd);
+      liveTuneSpdDiagVal.textContent = Math.round(spdDiag);
+      liveTuneAccVal.textContent     = Math.round(acc);
+      liveTuneDecelVal.textContent   = Math.round(decel);
+      liveTuneCurrVal.textContent    = curr > 0 ? curr : "—";
+    } else {
+      tuneLiveBadge.textContent = "Inactif";
+      tuneLiveBadge.style.background = "#1f2a3a";
+      tuneLiveBadge.style.color      = "#888";
+      tuneLiveBadge.style.border     = "1px solid #2a3a4a";
+      liveTuneSpdVal.textContent     = "—";
+      liveTuneSpdDiagVal.textContent = "—";
+      liveTuneAccVal.textContent     = "—";
+      liveTuneDecelVal.textContent   = "—";
+      liveTuneCurrVal.textContent    = "—";
     }
   }
 
@@ -1436,17 +1558,30 @@ const pid = boardState[key];
         if (typeof d.pending !== "undefined") fwPending = (d.pending|0);
         // AutoTune telemetry
         if (typeof d.tuning !== "undefined") {
-          updateTuneUI(!!d.tuning,
+          const nowTuning = !!d.tuning;
+          if (nowTuning && !tuneBusy) tuneStartMs = Date.now();  // capture start time
+          if (!nowTuning) tuneStartMs = null;
+          updateTuneUI(nowTuning,
                        typeof d.tunePhase === "number" ? d.tunePhase : 0,
                        typeof d.tunePct   === "number" ? d.tunePct   : 0);
+          updateLiveTuneCard(
+            nowTuning,
+            typeof d.liveTuneSpd     === "number" ? d.liveTuneSpd     : 0,
+            typeof d.liveTuneSpdDiag === "number" ? d.liveTuneSpdDiag : 0,
+            typeof d.liveTuneAcc     === "number" ? d.liveTuneAcc     : 0,
+            typeof d.liveTuneDecel   === "number" ? d.liveTuneDecel   : 0,
+            typeof d.liveTuneCurr    === "number" ? d.liveTuneCurr    : 0
+          );
         }
         // Saved tune settings card
         if (typeof d.tuneValid !== "undefined") {
           updateTuneResultCard(
             !!d.tuneValid,
-            typeof d.tuneSpd  === "number" ? d.tuneSpd  : 0,
-            typeof d.tuneAcc  === "number" ? d.tuneAcc  : 0,
-            typeof d.tuneCurr === "number" ? d.tuneCurr : 0
+            typeof d.tuneSpd     === "number" ? d.tuneSpd     : 0,
+            typeof d.tuneSpdDiag === "number" ? d.tuneSpdDiag : 0,
+            typeof d.tuneAcc     === "number" ? d.tuneAcc     : 0,
+            typeof d.tuneDecel   === "number" ? d.tuneDecel   : 0,
+            typeof d.tuneCurr    === "number" ? d.tuneCurr    : 0
           );
         }
         // Tune log messages arrive as a separate frame type
@@ -1479,14 +1614,7 @@ const pid = boardState[key];
     stopHold();
     if(tuneBusy){ return; }
     tuneLogEl.textContent = "";
-    send({cmd:"start_tuning", mode:"full"});
-  });
-
-  tuneQuickBtn.addEventListener("click", ()=>{
-    stopHold();
-    if(tuneBusy){ return; }
-    tuneLogEl.textContent = "";
-    send({cmd:"start_tuning", mode:"quick"});
+    send({cmd:"start_tuning"});
   });
 
   tuneStopBtn.addEventListener("click", ()=>{
@@ -1571,28 +1699,51 @@ void webPushTelemetry() {
   calib = (g_calibState != CALIB_IDLE);
   portEXIT_CRITICAL(&gMux);
 
-  // AutoTune state (volatile reads — no lock needed for single-word values)
-  bool     tuning     = g_tuneActive;
-  uint8_t  tunePh     = (uint8_t)g_tunePhase;
-  int      tunePct    = g_tuneProgress;
-  uint8_t  sysState   = (uint8_t)g_systemState;
-  bool     tuneValid  = g_tuneSettings.tuningValid;
-  float    tuneSpd    = g_tuneSettings.safeSpeed;
-  float    tuneAcc    = g_tuneSettings.safeAccel;
-  uint16_t tuneCurr   = g_tuneSettings.motorCurrent;
+  // AutoTune state snapshot.
+  bool         tuning;
+  uint8_t      tunePh;
+  int          tunePct;
+  uint8_t      sysState;
+  TuneSettings tuneSnapshot;
+  float        liveTuneSpd;
+  float        liveTuneSpdDiag;
+  float        liveTuneAcc;
+  float        liveTuneDecel;
+  uint16_t     liveTuneCurr;
+
+  portENTER_CRITICAL(&gMux);
+  tuning         = g_tuneActive;
+  tunePh         = (uint8_t)g_tunePhase;
+  tunePct        = g_tuneProgress;
+  sysState       = (uint8_t)g_systemState;
+  tuneSnapshot   = g_tuneSettings;
+  liveTuneSpd    = g_tuneLiveAxisSpeed;
+  liveTuneSpdDiag= g_tuneLiveDiagSpeed;
+  liveTuneAcc    = g_tuneLiveAccel;
+  liveTuneDecel  = g_tuneLiveDecel;
+  liveTuneCurr   = g_tuneCurrentMa;
+  portEXIT_CRITICAL(&gMux);
+
+  bool     tuneValid    = tuneSnapshot.tuningValid;
+  float    tuneSpd      = tuneSnapshot.safeSpeed;
+  float    tuneSpdDiag  = tuneSnapshot.safeSpeedDiag;
+  float    tuneAcc      = tuneSnapshot.safeAccel;
+  float    tuneDecel    = tuneSnapshot.safeDecel;
+  uint16_t tuneCurr     = tuneSnapshot.motorCurrent;
 
   long xDisp = xAbs - cxAbs;
   long yDisp = yAbs - cyAbs;
   busy    = commandsIsBusy();
   pending = commandsPendingCount();
 
-  char msg[640];
+  char msg[680];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
            "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,"
            "\"busy\":%s,\"pending\":%u,"
            "\"sysState\":%u,\"tuning\":%s,\"tunePhase\":%u,\"tunePct\":%d,"
-           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneAcc\":%.0f,\"tuneCurr\":%u}",
+           "\"liveTuneSpd\":%.0f,\"liveTuneSpdDiag\":%.0f,\"liveTuneAcc\":%.0f,\"liveTuneDecel\":%.0f,\"liveTuneCurr\":%u,"
+           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u}",
            pct, v, i, xDisp, yDisp, (unsigned)sp,
            (magOn     ? "true" : "false"),
            (hallY     ? "true" : "false"),
@@ -1604,8 +1755,9 @@ void webPushTelemetry() {
            (tuning    ? "true" : "false"),
            (unsigned)tunePh,
            tunePct,
+           liveTuneSpd, liveTuneSpdDiag, liveTuneAcc, liveTuneDecel, (unsigned)liveTuneCurr,
            (tuneValid ? "true" : "false"),
-           tuneSpd, tuneAcc,
+           tuneSpd, tuneSpdDiag, tuneAcc, tuneDecel,
            (unsigned)tuneCurr);
 
   webSocket.broadcastTXT(msg);

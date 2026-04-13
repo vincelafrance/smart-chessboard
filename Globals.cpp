@@ -96,15 +96,24 @@ volatile bool      g_tuneActive   = false;
 volatile bool      g_tuneAbortReq = false;
 
 TuneSettings g_tuneSettings = {
-    /* safeSpeed    */ 8600.0f,
-    /* safeAccel    */ 6000.0f,
-    /* motorCurrent */ 850,
-    /* tuningValid  */ false,
-    /* boundsValid  */ false,
+    /* safeSpeed     */ 8600.0f,
+    /* safeSpeedDiag */ 6000.0f,
+    /* safeAccel     */ 6000.0f,
+    /* safeDecel     */ 6000.0f,
+    /* motorCurrent  */ 850,
+    /* tuningValid   */ false,
+    /* boundsValid   */ false,
 };
 
-volatile float g_overrideVmax  = 0.0f;
-volatile float g_overrideAccel = 0.0f;
+volatile float g_overrideVmax     = 0.0f;
+volatile float g_overrideDiagVmax = 0.0f;
+volatile float g_overrideAccel    = 0.0f;
+volatile float g_overrideDecel    = 0.0f;
+volatile uint16_t g_tuneCurrentMa = 0;
+volatile float g_tuneLiveAxisSpeed = 0.0f;
+volatile float g_tuneLiveDiagSpeed = 0.0f;
+volatile float g_tuneLiveAccel     = 0.0f;
+volatile float g_tuneLiveDecel     = 0.0f;
 
 DriftRecord     g_driftLog[MAX_DRIFT_LOG];
 volatile uint8_t g_driftCount = 0;

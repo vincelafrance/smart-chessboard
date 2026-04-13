@@ -47,6 +47,8 @@ enum DriverCurrentProfile : uint8_t {
 static bool g_tmcReady = false;
 static DriverCurrentProfile g_profile = PROFILE_CRUISE;
 static uint8_t g_microsteps = TMC_MICROSTEPS_COARSE;
+static bool g_motionProfileLocked = false;
+static uint8_t g_lockedMicrosteps = TMC_MICROSTEPS_COARSE;
 // Runtime current overrides (0 = use compiled defaults)
 static uint16_t g_overrideCruiseMa = 0;
 static uint16_t g_overrideFastMa   = 0;
@@ -124,6 +126,19 @@ void serviceDriversUART(float vA_steps_s, float vB_steps_s, bool wantsMove, bool
   const float vAbs = fmaxf(fabsf(vA_steps_s), fabsf(vB_steps_s));
   const unsigned long nowMs = millis();
 
+  if (g_motionProfileLocked) {
+    bool canSwitchMs = (nowMs - g_lastMicrostepSwitchMs) >= MICROSTEP_SWITCH_MIN_MS;
+    bool nearStop = (vAbs <= TH_SAFE_SWITCH_SPEED);
+    if (g_microsteps != g_lockedMicrosteps && canSwitchMs && (!wantsMove || nearStop)) {
+      applyMicrosteps(g_lockedMicrosteps);
+    }
+
+    DriverCurrentProfile lockedProfile = wantsMove ? PROFILE_CRUISE : PROFILE_HOLD;
+    bool canSwitchProfile = (nowMs - g_lastProfileSwitchMs) >= PROFILE_SWITCH_MIN_MS;
+    if (lockedProfile != g_profile && canSwitchProfile) applyProfile(lockedProfile);
+    return;
+  }
+
   // Keep 1/16 for precision phases and at idle; prefer 1/8 during regular travel.
   uint8_t nextMs = (precisionMode || !wantsMove) ? TMC_MICROSTEPS_FINE : TMC_MICROSTEPS_COARSE;
   bool canSwitchMs = (nowMs - g_lastMicrostepSwitchMs) >= MICROSTEP_SWITCH_MIN_MS;
@@ -150,7 +165,37 @@ void serviceDriversUART(float vA_steps_s, float vB_steps_s, bool wantsMove, bool
 }
 
 uint8_t getDriversUARTMicrosteps() {
+  if (g_motionProfileLocked) return g_lockedMicrosteps;
   return g_microsteps;
+}
+
+void setMotionProfileLock(bool enabled, uint8_t microsteps, uint16_t moveCurrentMa) {
+  g_motionProfileLocked = enabled;
+  if (!enabled) return;
+
+  if (microsteps != TMC_MICROSTEPS_FINE && microsteps != TMC_MICROSTEPS_COARSE) {
+    microsteps = TMC_MICROSTEPS_COARSE;
+  }
+  g_lockedMicrosteps = microsteps;
+
+  // Clear any per-move current classification so the tuned current is the
+  // single source of truth for all application-level motion.
+  g_overrideDiagMa  = 0;
+  g_overrideLineMa  = 0;
+  g_overrideShortMa = 0;
+
+  // Use the tuned current uniformly for all moving phases; no hidden "fast"
+  // boost above the tuned value.
+  setCurrentOverrides(moveCurrentMa, moveCurrentMa);
+
+  if (g_tmcReady) {
+    applyMicrosteps(g_lockedMicrosteps);
+    applyProfile(PROFILE_CRUISE);
+  }
+}
+
+bool isMotionProfileLocked() {
+  return g_motionProfileLocked;
 }
 
 void setCurrentOverrides(uint16_t cruiseMa, uint16_t fastMa) {
@@ -164,7 +209,17 @@ void setCurrentOverrides(uint16_t cruiseMa, uint16_t fastMa) {
   applyProfile(g_profile);
 }
 
+uint16_t getCurrentOverrideCruiseMa() {
+  return g_overrideCruiseMa;
+}
+
 void setCurrentOverridesPerGroup(uint16_t diagMa, uint16_t lineMa, uint16_t shortMa) {
+  if (g_motionProfileLocked) {
+    g_overrideDiagMa = 0;
+    g_overrideLineMa = 0;
+    g_overrideShortMa = 0;
+    return;
+  }
   const uint16_t maxMa = 1500;
   g_overrideDiagMa  = (diagMa  > maxMa) ? maxMa : diagMa;
   g_overrideLineMa  = (lineMa  > maxMa) ? maxMa : lineMa;
@@ -174,6 +229,7 @@ void setCurrentOverridesPerGroup(uint16_t diagMa, uint16_t lineMa, uint16_t shor
 }
 
 void selectCurrentsForMove(long fromX, long fromY, long toX, long toY) {
+  if (g_motionProfileLocked) return;
   if (g_overrideDiagMa == 0 && g_overrideLineMa == 0 && g_overrideShortMa == 0) return;  // no per-group data
 
   long dx = labs(toX - fromX);
@@ -209,4 +265,3 @@ void selectCurrentsForMove(long fromX, long fromY, long toX, long toY) {
   // Apply immediately if we are already in CRUISE profile.
   if (g_profile == PROFILE_CRUISE) applyProfile(PROFILE_CRUISE);
 }
-

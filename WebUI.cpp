@@ -183,6 +183,19 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
           <button class="mini" id="magnetBtn">🧲 Electroaimant: OFF</button>
           <button class="mini" id="tuneBtn">⚙️ Auto Tune</button>
           <button class="mini" id="tuneStopBtn" style="display:none;">🛑 Stop Tune</button>
+          <button class="mini" id="testRunBtn">♟️ Test Run</button>
+          <button class="mini" id="testRunStopBtn" style="display:none;">🛑 Stop Test</button>
+        </div>
+
+        <div id="testRunCard" style="display:none;margin-top:10px;padding:10px;background:#0e1522;border:1px solid #1f2a3a;border-radius:14px;">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <span style="font-weight:700;font-size:13px;">♟️ Test Run</span>
+            <span id="testRunStepTxt" style="font-size:12px;opacity:.8;">—</span>
+            <span id="testRunPctTxt" style="font-size:12px;font-weight:700;color:#54a0ff;">0%</span>
+          </div>
+          <div class="bar" style="margin-top:8px;">
+            <div class="fill" id="testRunFill" style="background:linear-gradient(90deg,#f9ca24,#f0932b);"></div>
+          </div>
         </div>
 
         <div id="tuneCard" style="display:none;margin-top:10px;padding:10px;background:#0e1522;border:1px solid #1f2a3a;border-radius:14px;">
@@ -218,16 +231,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
               <div class="label" style="margin-top:2px;">steps/s</div>
             </div>
             <div class="pill" style="min-width:90px;">
-              <div class="label">Accélération</div>
-              <div class="val" id="liveTuneAccVal" style="font-size:16px;">—</div>
-              <div class="label" style="margin-top:2px;">steps/s²</div>
-            </div>
-            <div class="pill" style="min-width:90px;">
-              <div class="label">Décélération</div>
-              <div class="val" id="liveTuneDecelVal" style="font-size:16px;">—</div>
-              <div class="label" style="margin-top:2px;">steps/s²</div>
-            </div>
-            <div class="pill" style="min-width:90px;">
               <div class="label">Courant</div>
               <div class="val" id="liveTuneCurrVal" style="font-size:16px;">—</div>
               <div class="label" style="margin-top:2px;">mA</div>
@@ -243,16 +246,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
               <div class="label">Vit. diagonales</div>
               <div class="val" id="tuneSpdDiagVal" style="font-size:16px;">—</div>
               <div class="label" style="margin-top:2px;">steps/s</div>
-            </div>
-            <div class="pill" style="min-width:90px;">
-              <div class="label">Accélération</div>
-              <div class="val" id="tuneAccVal" style="font-size:16px;">—</div>
-              <div class="label" style="margin-top:2px;">steps/s²</div>
-            </div>
-            <div class="pill" style="min-width:90px;">
-              <div class="label">Décélération</div>
-              <div class="val" id="tuneDecelVal" style="font-size:16px;">—</div>
-              <div class="label" style="margin-top:2px;">steps/s²</div>
             </div>
             <div class="pill" style="min-width:90px;">
               <div class="label">Courant moteur</div>
@@ -293,6 +286,28 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         </div>
       </div>
     </div>
+
+    <div class="card">
+      <h1>📡 WiFi</h1>
+      <div style="font-size:13px;opacity:.75;margin-bottom:14px;">
+        Connecte l'ESP32 à ton réseau maison pour accéder au WebUI depuis n'importe quel appareil sans changer de WiFi.
+        Une fois connecté, utilise <b>http://smartchessboard.local</b> ou l'IP affichée dans le port série.
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <div>
+          <div class="label" style="margin-bottom:5px;">Nom du réseau (SSID)</div>
+          <input id="wifiSsid" type="text" placeholder="MonWiFi" autocomplete="off" autocorrect="off" spellcheck="false"
+            style="width:100%;box-sizing:border-box;background:#0e1522;border:1px solid #1f2a3a;border-radius:10px;padding:10px 12px;color:#e8eef6;font-size:14px;outline:none;"/>
+        </div>
+        <div>
+          <div class="label" style="margin-bottom:5px;">Mot de passe</div>
+          <input id="wifiPass" type="password" placeholder="••••••••" autocomplete="new-password"
+            style="width:100%;box-sizing:border-box;background:#0e1522;border:1px solid #1f2a3a;border-radius:10px;padding:10px 12px;color:#e8eef6;font-size:14px;outline:none;"/>
+        </div>
+        <button class="mini" id="wifiSaveBtn" style="margin-top:2px;width:100%;">💾 Sauvegarder et redémarrer</button>
+        <div id="wifiMsg" style="font-size:12px;min-height:16px;"></div>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -314,11 +329,18 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   const bNorm = document.getElementById("spNorm");
   const bFast = document.getElementById("spFast");
 
-  const magnetBtn    = document.getElementById("magnetBtn");
-  const calibBtn     = document.getElementById("calibBtn");
-  const diag4Btn     = document.getElementById("diag4Btn");
-  const tuneBtn      = document.getElementById("tuneBtn");
-  const tuneStopBtn  = document.getElementById("tuneStopBtn");
+  const magnetBtn       = document.getElementById("magnetBtn");
+  const calibBtn        = document.getElementById("calibBtn");
+  const diag4Btn        = document.getElementById("diag4Btn");
+  const tuneBtn         = document.getElementById("tuneBtn");
+  const tuneStopBtn     = document.getElementById("tuneStopBtn");
+  const testRunBtn      = document.getElementById("testRunBtn");
+  const testRunStopBtn  = document.getElementById("testRunStopBtn");
+  const testRunCard     = document.getElementById("testRunCard");
+  const testRunStepTxt  = document.getElementById("testRunStepTxt");
+  const testRunPctTxt   = document.getElementById("testRunPctTxt");
+  const testRunFill     = document.getElementById("testRunFill");
+  let testRunBusy = false;
   const tuneCard      = document.getElementById("tuneCard");
   const tunePhaseTxt  = document.getElementById("tunePhaseTxt");
   const tunePctTxt    = document.getElementById("tunePctTxt");
@@ -329,13 +351,9 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   const tuneLiveBadge  = document.getElementById("tuneLiveBadge");
   const tuneSpdVal     = document.getElementById("tuneSpdVal");
   const tuneSpdDiagVal = document.getElementById("tuneSpdDiagVal");
-  const tuneAccVal     = document.getElementById("tuneAccVal");
-  const tuneDecelVal   = document.getElementById("tuneDecelVal");
   const tuneCurrVal    = document.getElementById("tuneCurrVal");
   const liveTuneSpdVal     = document.getElementById("liveTuneSpdVal");
   const liveTuneSpdDiagVal = document.getElementById("liveTuneSpdDiagVal");
-  const liveTuneAccVal     = document.getElementById("liveTuneAccVal");
-  const liveTuneDecelVal   = document.getElementById("liveTuneDecelVal");
   const liveTuneCurrVal    = document.getElementById("liveTuneCurrVal");
   let magnetOn   = false;
   let calibBusy  = false;
@@ -344,7 +362,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 
   const TUNE_PHASE_NAMES = [
     "Idle","Référence","Répétabilité","Rampe vitesse",
-    "—","Courant moteur","Vérification finale",
+    "Comparaison efficacité","Courant moteur","Vérification finale",
     "Terminé ✅","Annulé","Erreur ❌"
   ];
 
@@ -352,10 +370,10 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   const PHASE_SPANS = [
     [0,   0],   // 0: IDLE
     [0,   5],   // 1: REFERENCE
-    [5,  10],   // 2: REPEATABILITY
-    [15, 45],   // 3: SPEED_RAMP (diag + axis)
-    [60,  0],   // 4: ACCEL_RAMP (removed)
-    [60, 25],   // 5: CURRENT
+    [5,   0],   // 2: REPEATABILITY (unused)
+    [5,  55],   // 3: SPEED_RAMP (diag + axis)
+    [60, 10],   // 4: efficiency comparison pass
+    [70, 15],   // 5: CURRENT
     [85, 15],   // 6: FINAL CHARACTERIZE
     [100, 0],   // 7: DONE
     [100, 0],   // 8: ABORTED
@@ -414,9 +432,29 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
     if(boardWrapEl) boardWrapEl.classList.toggle("calibrating", calibBusy);
   }
 
+  function updateTestRunUI(active, step, idx, total) {
+    testRunBusy = !!active;
+    testRunBtn.style.display     = testRunBusy ? "none" : "";
+    testRunStopBtn.style.display = testRunBusy ? "" : "none";
+    testRunCard.style.display    = testRunBusy ? "block" : "none";
+    if (testRunBusy) {
+      testRunStepTxt.textContent = step || "—";
+      const pct = (total > 0) ? Math.round(100 * (idx + 1) / total) : 0;
+      testRunPctTxt.textContent = pct + "%";
+      testRunFill.style.width   = pct + "%";
+    } else {
+      testRunStepTxt.textContent = "—";
+      testRunPctTxt.textContent  = "0%";
+      testRunFill.style.width    = "0%";
+    }
+    // Disable test run button while auto tune is running
+    testRunBtn.disabled = tuneBusy;
+    tuneBtn.disabled    = testRunBusy;
+  }
+
   let savedTuneCache = null;
 
-  function renderTuneResultCard(valid, spd, spdDiag, acc, decel, curr) {
+  function renderTuneResultCard(valid, spd, spdDiag, curr) {
     if (valid) {
       tuneValidBadge.textContent = "✅ Valide — NVS";
       tuneValidBadge.style.background = "rgba(29,209,161,0.15)";
@@ -424,8 +462,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       tuneValidBadge.style.border     = "1px solid rgba(29,209,161,0.4)";
       tuneSpdVal.textContent     = Math.round(spd);
       tuneSpdDiagVal.textContent = Math.round(spdDiag);
-      tuneAccVal.textContent     = Math.round(acc);
-      tuneDecelVal.textContent   = Math.round(decel);
       tuneCurrVal.textContent    = curr;
     } else {
       tuneValidBadge.textContent = "Non calibré";
@@ -434,16 +470,14 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       tuneValidBadge.style.border     = "1px solid #2a3a4a";
       tuneSpdVal.textContent     = "—";
       tuneSpdDiagVal.textContent = "—";
-      tuneAccVal.textContent     = "—";
-      tuneDecelVal.textContent   = "—";
       tuneCurrVal.textContent    = "—";
     }
   }
 
-  function updateTuneResultCard(valid, spd, spdDiag, acc, decel, curr) {
+  function updateTuneResultCard(valid, spd, spdDiag, curr) {
     if (valid) {
-      savedTuneCache = { spd, spdDiag, acc, decel, curr };
-      renderTuneResultCard(true, spd, spdDiag, acc, decel, curr);
+      savedTuneCache = { spd, spdDiag, curr };
+      renderTuneResultCard(true, spd, spdDiag, curr);
       return;
     }
 
@@ -451,16 +485,14 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       renderTuneResultCard(true,
         savedTuneCache.spd,
         savedTuneCache.spdDiag,
-        savedTuneCache.acc,
-        savedTuneCache.decel,
         savedTuneCache.curr);
       return;
     }
 
-    renderTuneResultCard(false, spd, spdDiag, acc, decel, curr);
+    renderTuneResultCard(false, spd, spdDiag, curr);
   }
 
-  function updateLiveTuneCard(active, spd, spdDiag, acc, decel, curr) {
+  function updateLiveTuneCard(active, spd, spdDiag, curr) {
     if (active) {
       tuneLiveBadge.textContent = "Actif";
       tuneLiveBadge.style.background = "rgba(84,160,255,0.16)";
@@ -468,8 +500,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       tuneLiveBadge.style.border     = "1px solid rgba(84,160,255,0.45)";
       liveTuneSpdVal.textContent     = Math.round(spd);
       liveTuneSpdDiagVal.textContent = Math.round(spdDiag);
-      liveTuneAccVal.textContent     = Math.round(acc);
-      liveTuneDecelVal.textContent   = Math.round(decel);
       liveTuneCurrVal.textContent    = curr > 0 ? curr : "—";
     } else {
       tuneLiveBadge.textContent = "Inactif";
@@ -478,8 +508,6 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       tuneLiveBadge.style.border     = "1px solid #2a3a4a";
       liveTuneSpdVal.textContent     = "—";
       liveTuneSpdDiagVal.textContent = "—";
-      liveTuneAccVal.textContent     = "—";
-      liveTuneDecelVal.textContent   = "—";
       liveTuneCurrVal.textContent    = "—";
     }
   }
@@ -1568,8 +1596,6 @@ const pid = boardState[key];
             nowTuning,
             typeof d.liveTuneSpd     === "number" ? d.liveTuneSpd     : 0,
             typeof d.liveTuneSpdDiag === "number" ? d.liveTuneSpdDiag : 0,
-            typeof d.liveTuneAcc     === "number" ? d.liveTuneAcc     : 0,
-            typeof d.liveTuneDecel   === "number" ? d.liveTuneDecel   : 0,
             typeof d.liveTuneCurr    === "number" ? d.liveTuneCurr    : 0
           );
         }
@@ -1579,14 +1605,21 @@ const pid = boardState[key];
             !!d.tuneValid,
             typeof d.tuneSpd     === "number" ? d.tuneSpd     : 0,
             typeof d.tuneSpdDiag === "number" ? d.tuneSpdDiag : 0,
-            typeof d.tuneAcc     === "number" ? d.tuneAcc     : 0,
-            typeof d.tuneDecel   === "number" ? d.tuneDecel   : 0,
             typeof d.tuneCurr    === "number" ? d.tuneCurr    : 0
           );
         }
         // Tune log messages arrive as a separate frame type
         if (d.type === "tuneLog" && typeof d.msg === "string") {
           appendTuneLog(d.msg);
+        }
+        // Chess Test Run telemetry
+        if (typeof d.testRun !== "undefined") {
+          updateTestRunUI(
+            !!d.testRun,
+            typeof d.trStep  === "string" ? d.trStep  : "—",
+            typeof d.trIdx   === "number" ? d.trIdx   : 0,
+            typeof d.trTotal === "number" ? d.trTotal : 0
+          );
         }
         runPhysicalResetPump();
       } catch(e) {}
@@ -1633,6 +1666,17 @@ const pid = boardState[key];
     setStatus("Test 1-2-3-4 envoyé", true);
   });
 
+  testRunBtn.addEventListener("click", ()=>{
+    stopHold();
+    if(testRunBusy || tuneBusy) return;
+    send({cmd:"start_test_run"});
+    setStatus("Test Run démarré…", true);
+  });
+
+  testRunStopBtn.addEventListener("click", ()=>{
+    send({cmd:"stop"});
+  });
+
   document.getElementById("resetBoard").addEventListener("click", ()=>{
     startPhysicalReset();
   });
@@ -1654,6 +1698,18 @@ const pid = boardState[key];
   setStatus('Tour: ' + (turn === "w" ? "Blancs" : "Noirs"), true);
   updateTurnOverlay();
   renderBoard();
+
+  document.getElementById("wifiSaveBtn").addEventListener("click", () => {
+    const ssid = document.getElementById("wifiSsid").value.trim();
+    const pass = document.getElementById("wifiPass").value;
+    const msg  = document.getElementById("wifiMsg");
+    if (!ssid) { msg.textContent = "⚠️ Entre le nom de ton réseau WiFi."; msg.style.color="#ff6b6b"; return; }
+    msg.textContent = "⏳ Sauvegarde en cours, l'ESP32 va redémarrer…";
+    msg.style.color = "#1dd1a1";
+    document.getElementById("wifiSaveBtn").disabled = true;
+    send({cmd:"wifiConfig", ssid, pass});
+  });
+
   connect();
 </script>
 </body>
@@ -1711,6 +1767,12 @@ void webPushTelemetry() {
   float        liveTuneDecel;
   uint16_t     liveTuneCurr;
 
+  // ChessTestRun snapshot
+  bool    testRunActive;
+  char    trStepSnap[64];
+  uint8_t trIdxSnap;
+  uint8_t trTotalSnap;
+
   portENTER_CRITICAL(&gMux);
   tuning         = g_tuneActive;
   tunePh         = (uint8_t)g_tunePhase;
@@ -1722,6 +1784,10 @@ void webPushTelemetry() {
   liveTuneAcc    = g_tuneLiveAccel;
   liveTuneDecel  = g_tuneLiveDecel;
   liveTuneCurr   = g_tuneCurrentMa;
+  testRunActive  = g_testRunActive;
+  strncpy(trStepSnap, (const char*)g_trStepName, 63); trStepSnap[63] = '\0';
+  trIdxSnap      = g_trStepIdx;
+  trTotalSnap    = g_trStepTotal;
   portEXIT_CRITICAL(&gMux);
 
   bool     tuneValid    = tuneSnapshot.tuningValid;
@@ -1736,14 +1802,15 @@ void webPushTelemetry() {
   busy    = commandsIsBusy();
   pending = commandsPendingCount();
 
-  char msg[680];
+  char msg[800];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
            "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,"
            "\"busy\":%s,\"pending\":%u,"
            "\"sysState\":%u,\"tuning\":%s,\"tunePhase\":%u,\"tunePct\":%d,"
            "\"liveTuneSpd\":%.0f,\"liveTuneSpdDiag\":%.0f,\"liveTuneAcc\":%.0f,\"liveTuneDecel\":%.0f,\"liveTuneCurr\":%u,"
-           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u}",
+           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u,"
+           "\"testRun\":%s,\"trStep\":\"%s\",\"trIdx\":%u,\"trTotal\":%u}",
            pct, v, i, xDisp, yDisp, (unsigned)sp,
            (magOn     ? "true" : "false"),
            (hallY     ? "true" : "false"),
@@ -1758,7 +1825,11 @@ void webPushTelemetry() {
            liveTuneSpd, liveTuneSpdDiag, liveTuneAcc, liveTuneDecel, (unsigned)liveTuneCurr,
            (tuneValid ? "true" : "false"),
            tuneSpd, tuneSpdDiag, tuneAcc, tuneDecel,
-           (unsigned)tuneCurr);
+           (unsigned)tuneCurr,
+           (testRunActive ? "true" : "false"),
+           trStepSnap,
+           (unsigned)trIdxSnap,
+           (unsigned)trTotalSnap);
 
   webSocket.broadcastTXT(msg);
 }

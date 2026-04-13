@@ -147,6 +147,31 @@ static void stepTask(void *param) {
       long ex = pathTx - xAbs;
       long ey = pathTy - yAbs;
 
+      // Pre-compute whether the current waypoint requires a full settle (magnet
+      // action or final destination) vs. a fly-through (intermediate routing
+      // corner with no magnet change, e.g. the turn point of a knight L-move).
+      // Done here — before the deadband/speed-cap logic — so fly-through
+      // waypoints can use a wider deadband and skip the near-target decel.
+      bool wpNeedsSettle;
+      {
+        uint8_t wpIdx2 = 0, wpCnt2 = 0;
+        bool autoMag2 = false;
+        int8_t magAct2 = -1;
+        portENTER_CRITICAL(&gMux);
+        wpIdx2   = g_wpIndex;
+        wpCnt2   = g_wpCount;
+        autoMag2 = g_autoMagnetPath;
+        if (wpIdx2 < wpCnt2) magAct2 = g_waypoints[wpIdx2].mag;
+        portEXIT_CRITICAL(&gMux);
+
+        const bool isFinal2 = (wpCnt2 > 0 && wpIdx2 == (uint8_t)(wpCnt2 - 1));
+        wpNeedsSettle = isFinal2;
+        if (autoMag2) {
+          if (magAct2 == 1 || magAct2 == 0) wpNeedsSettle = true;
+          else if (magAct2 == -1 && wpIdx2 == 1) wpNeedsSettle = true;
+        }
+      }
+
       // AutoTune may inject a speed override; 0 means use firmware default.
       float pathVmax = (g_overrideVmax > 0.0f) ? g_overrideVmax : PATH_VMAX_XY;
 
@@ -173,27 +198,13 @@ static void stepTask(void *param) {
       float pathMinV = PATH_MIN_VXY;
       float vCap = pathVmax;
 
-      const bool xDone = (labs(ex) <= RECENTER_DEADBAND_XY);
-      const bool yDone = (labs(ey) <= RECENTER_DEADBAND_XY);
+      // Fly-through waypoints use a wider deadband so the carriage advances
+      // without decelerating to a near-stop at every intermediate corner.
+      const long wpDeadband = wpNeedsSettle ? (long)RECENTER_DEADBAND_XY : 120L;
+      const bool xDone = (labs(ex) <= wpDeadband);
+      const bool yDone = (labs(ey) <= wpDeadband);
 
       if (!xDone || !yDone) {
-        float minPathV = pathMinV;
-        const float errMag = fmaxf(fabsf((float)ex), fabsf((float)ey));
-        if (!xDone && !yDone) {
-          // Only soften diagonals close to the target; keep long traversals snappy.
-          if (errMag < 220.0f) {
-            vCap *= 0.55f;
-            minPathV *= 0.65f;
-          }
-        }
-
-        // Taper minimum speed near target to reduce end-of-diagonal bounce.
-        if (errMag < 80.0f) {
-          float t = clampf(errMag / 80.0f, 0.0f, 1.0f);
-          const float minNear = 120.0f;
-          minPathV = minNear + (minPathV - minNear) * t;
-        }
-
         float vx_raw = PATH_KP * (float)ex;
         float vy_raw = PATH_KP * (float)ey;
 
@@ -207,8 +218,8 @@ static void stepTask(void *param) {
         const bool xVeryNear = (labs(ex) <= RECENTER_DEADBAND_XY);
         const bool yVeryNear = (labs(ey) <= RECENTER_DEADBAND_XY);
 
-        if (!xDone && !xVeryNear && fabsf(vx_t) < minPathV) vx_t = (ex >= 0) ? minPathV : -minPathV;
-        if (!yDone && !yVeryNear && fabsf(vy_t) < minPathV) vy_t = (ey >= 0) ? minPathV : -minPathV;
+        if (!xDone && !xVeryNear && fabsf(vx_t) < pathMinV) vx_t = (ex >= 0) ? pathMinV : -pathMinV;
+        if (!yDone && !yVeryNear && fabsf(vy_t) < pathMinV) vy_t = (ey >= 0) ? pathMinV : -pathMinV;
 
         settleStartMs = 0;
       } else {
@@ -257,83 +268,79 @@ static void stepTask(void *param) {
           continue;
         }
 
-        if (settleStartMs == 0) settleStartMs = nowMs;
+        bool needPickupDelay = false;
 
-        if (nowMs - settleStartMs >= PATH_SETTLE_MS) {
-          bool needPickupDelay = false;
+        if (autoMag) {
+          // Waypoint-driven magnet control (supports multi-piece sequences, e.g. castling)
+          if (magAction == 1) {
+            magnetSet(true);
+            Serial.println("[MAGNET] AUTO ON at waypoint");
+            needPickupDelay = true;
+          } else if (magAction == 0) {
+            magnetSet(false);
+            Serial.println("[MAGNET] AUTO OFF at waypoint");
+          }
 
-          if (autoMag) {
-            // Waypoint-driven magnet control (supports multi-piece sequences, e.g. castling)
-            if (magAction == 1) {
+          // Backwards-compat: if mag actions are not used (-1), keep old behavior
+          if (magAction == -1) {
+            if (arrivedIdx == 1) {
               magnetSet(true);
-              Serial.println("[MAGNET] AUTO ON at waypoint");
+              Serial.println("[MAGNET] AUTO ON at FROM center");
               needPickupDelay = true;
-            } else if (magAction == 0) {
+            }
+            if (isFinalWp) {
               magnetSet(false);
-              Serial.println("[MAGNET] AUTO OFF at waypoint");
+              Serial.println("[MAGNET] AUTO OFF at TO center");
+              portENTER_CRITICAL(&gMux);
+              g_autoMagnetPath = false;
+              portEXIT_CRITICAL(&gMux);
             }
-
-            // Backwards-compat: if mag actions are not used (-1), keep old behavior
-            if (magAction == -1) {
-              if (arrivedIdx == 1) {
-                magnetSet(true);
-                Serial.println("[MAGNET] AUTO ON at FROM center");
-                needPickupDelay = true;
-              }
-              if (isFinalWp) {
-                magnetSet(false);
-                Serial.println("[MAGNET] AUTO OFF at TO center");
-                portENTER_CRITICAL(&gMux);
-                g_autoMagnetPath = false;
-                portEXIT_CRITICAL(&gMux);
-              }
-            } else {
-              // If we used waypoint actions, only auto-stop at the final waypoint.
-              if (isFinalWp) {
-                portENTER_CRITICAL(&gMux);
-                g_autoMagnetPath = false;
-                portEXIT_CRITICAL(&gMux);
-              }
-            }
-
-            // Hold briefly after a pickup to let the piece fully attach before moving away.
-            if (needPickupDelay) {
-              if (!pickupWaitActive || pickupWaitWpIdx != arrivedIdx) {
-                pickupWaitActive = true;
-                pickupWaitWpIdx = arrivedIdx;
-                pickupWaitStartMs = nowMs;
-              }
-              if ((nowMs - pickupWaitStartMs) < PATH_PICKUP_SETTLE_MS) {
-                vx_t = 0.0f;
-                vy_t = 0.0f;
-                continue;
-              }
-              pickupWaitActive = false;
-              pickupWaitWpIdx = 255;
-            } else if (pickupWaitActive && pickupWaitWpIdx == arrivedIdx) {
-              pickupWaitActive = false;
-              pickupWaitWpIdx = 255;
-            }
-          }
-
-          portENTER_CRITICAL(&gMux);
-          uint8_t idx = g_wpIndex;
-          uint8_t c = g_wpCount;
-          idx++;
-          if (idx >= c) {
-            g_pathActive = false;
-            g_wpCount = 0;
-            g_wpIndex = 0;
           } else {
-            g_wpIndex = idx;
-            g_pathTargetX = g_waypoints[idx].x;
-            g_pathTargetY = g_waypoints[idx].y;
+            // If we used waypoint actions, only auto-stop at the final waypoint.
+            if (isFinalWp) {
+              portENTER_CRITICAL(&gMux);
+              g_autoMagnetPath = false;
+              portEXIT_CRITICAL(&gMux);
+            }
           }
-          g_lastCmdMs = nowMs;
-          portEXIT_CRITICAL(&gMux);
 
-          settleStartMs = 0;
+          // Hold briefly after a pickup to let the piece fully attach before moving away.
+          if (needPickupDelay) {
+            if (!pickupWaitActive || pickupWaitWpIdx != arrivedIdx) {
+              pickupWaitActive = true;
+              pickupWaitWpIdx = arrivedIdx;
+              pickupWaitStartMs = nowMs;
+            }
+            if ((nowMs - pickupWaitStartMs) < PATH_PICKUP_SETTLE_MS) {
+              vx_t = 0.0f;
+              vy_t = 0.0f;
+              continue;
+            }
+            pickupWaitActive = false;
+            pickupWaitWpIdx = 255;
+          } else if (pickupWaitActive && pickupWaitWpIdx == arrivedIdx) {
+            pickupWaitActive = false;
+            pickupWaitWpIdx = 255;
+          }
         }
+
+        portENTER_CRITICAL(&gMux);
+        uint8_t idx = g_wpIndex;
+        uint8_t c = g_wpCount;
+        idx++;
+        if (idx >= c) {
+          g_pathActive = false;
+          g_wpCount = 0;
+          g_wpIndex = 0;
+        } else {
+          g_wpIndex = idx;
+          g_pathTargetX = g_waypoints[idx].x;
+          g_pathTargetY = g_waypoints[idx].y;
+        }
+        g_lastCmdMs = nowMs;
+        portEXIT_CRITICAL(&gMux);
+
+        settleStartMs = 0;
 
         vx_t = 0.0f;
         vy_t = 0.0f;

@@ -11,6 +11,7 @@
 #include "MotionCoreXY.h"
 #include "DriversUART.h"
 #include "AutoTune.h"
+#include "ChessTestRun.h"
 
 unsigned long lastBattMs = 0;
 unsigned long lastPushMs = 0;
@@ -76,6 +77,7 @@ void setup() {
   // Load NVS-persisted tune settings and apply them to the motion system.
   // Must come after initDriversUART() so setCurrentOverrides() has a driver.
   autoTuneInit();
+  chessTestRunInit();
 }
 
 void loop() {
@@ -115,7 +117,7 @@ void loop() {
   }
 
   // Push telemetry
-  if (now - lastPushMs >= 250) {
+  if (now - lastPushMs >= 100) {
     lastPushMs = now;
     webPushTelemetry();
   }

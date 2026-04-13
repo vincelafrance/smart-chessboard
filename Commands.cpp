@@ -6,6 +6,9 @@
 #include "BoardMapping.h"
 #include "MotionCoreXY.h"
 #include "AutoTune.h"
+#include "ChessTestRun.h"
+#include "WiFiNet.h"
+#include "WebUI.h"
 
 enum PendingMoveType : uint8_t {
   PM_SQUARE = 0,
@@ -144,6 +147,12 @@ void setDirCommand(const String& dir) {
 
 void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   (void)num;
+  // Push state immediately when a new client connects so the UI populates
+  // instantly instead of waiting for the next scheduled 100ms push.
+  if (type == WStype_CONNECTED) {
+    webPushTelemetry();
+    return;
+  }
   if (type != WStype_TEXT) return;
 
   StaticJsonDocument<1024> doc;
@@ -201,10 +210,32 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     return;
   }
 
+  // { "cmd": "start_test_run" }
+  if (strcmp(cmd, "start_test_run") == 0) {
+    if (!chessTestRunStart()) {
+      Serial.println("[CMD] start_test_run rejected (busy or no calib)");
+    }
+    return;
+  }
+
+  // { "cmd": "wifiConfig", "ssid": "...", "pass": "..." }
+  // Save WiFi credentials to NVS and reboot to connect to the home network.
+  if (strcmp(cmd, "wifiConfig") == 0) {
+    const char* ssid = doc["ssid"];
+    const char* pass = doc["pass"];
+    if (!ssid || strlen(ssid) == 0) {
+      Serial.println("[WIFI] wifiConfig ignored — empty SSID");
+      return;
+    }
+    saveWifiCreds(ssid, pass ? pass : "");
+    return;  // never reached (saveWifiCreds reboots)
+  }
+
   // { "cmd": "stop" }
-  // Emergency stop: halts motion and aborts any running AutoTune.
+  // Emergency stop: halts motion and aborts any running AutoTune or TestRun.
   if (strcmp(cmd, "stop") == 0) {
     autoTuneStop();
+    chessTestRunStop();
     clearPendingMoves();
     abortPath();
     portENTER_CRITICAL(&gMux);

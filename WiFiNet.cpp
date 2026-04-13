@@ -1,16 +1,51 @@
 #include "WiFiNet.h"
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 
 static bool s_otaReady = false;
 
+// Load credentials saved via the WebUI. Returns true if a non-empty SSID was found.
+static bool loadWifiCreds(char* ssid, size_t ssidLen, char* pass, size_t passLen) {
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  String s = prefs.getString("ssid", "");
+  String p = prefs.getString("pass", "");
+  prefs.end();
+  if (s.length() == 0) return false;
+  strncpy(ssid, s.c_str(), ssidLen - 1); ssid[ssidLen - 1] = '\0';
+  strncpy(pass, p.c_str(), passLen - 1); pass[passLen - 1] = '\0';
+  return true;
+}
+
+// Save credentials to NVS and reboot so the new network is used immediately.
+void saveWifiCreds(const char* ssid, const char* pass) {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass ? pass : "");
+  prefs.end();
+  Serial.printf("[WIFI] Credentials saved (SSID: %s) — rebooting\n", ssid);
+  delay(300);
+  ESP.restart();
+}
+
 void startWiFi() {
-  bool wantSTA = (strlen(WIFI_SSID) > 0);
-  if (wantSTA) {
+  char nvsSsid[64] = "";
+  char nvsPass[64] = "";
+  bool hasNvs = loadWifiCreds(nvsSsid, sizeof(nvsSsid), nvsPass, sizeof(nvsPass));
+
+  // NVS credentials take priority; fall back to compile-time constants.
+  const char* useSsid = hasNvs ? nvsSsid : WIFI_SSID;
+  const char* usePass = hasNvs ? nvsPass : WIFI_PASS;
+
+  if (strlen(useSsid) > 0) {
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(useSsid, usePass);
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(250);
     if (WiFi.status() == WL_CONNECTED) return;
+    Serial.println("[WIFI] STA connection failed — falling back to AP mode");
   }
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -20,9 +55,20 @@ void startWiFi() {
 void initOTA() {
   s_otaReady = false;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[OTA] Disabled: OTA upload from Arduino IDE needs STA WiFi.");
+  bool isSTA = (WiFi.getMode() == WIFI_MODE_STA || WiFi.getMode() == WIFI_MODE_APSTA)
+               && (WiFi.status() == WL_CONNECTED);
+  bool isAP  = (WiFi.getMode() == WIFI_MODE_AP  || WiFi.getMode() == WIFI_MODE_APSTA);
+
+  if (!isSTA && !isAP) {
+    Serial.println("[OTA] Disabled: no WiFi active.");
     return;
+  }
+
+  // In AP mode, start mDNS manually so the hostname resolves on the AP subnet.
+  if (isAP && !isSTA) {
+    if (!MDNS.begin("smartchessboard")) {
+      Serial.println("[OTA] mDNS start failed (AP mode) — use IP 192.168.4.1");
+    }
   }
 
   ArduinoOTA.setHostname("smartchessboard");
@@ -57,9 +103,11 @@ void initOTA() {
 
   ArduinoOTA.begin();
   s_otaReady = true;
-  Serial.printf("[OTA] Ready on %s.local (%s)\n",
-                ArduinoOTA.getHostname().c_str(),
-                WiFi.localIP().toString().c_str());
+
+  IPAddress ip = isAP ? WiFi.softAPIP() : WiFi.localIP();
+  Serial.printf("[OTA] Ready — hostname: smartchessboard.local  IP: %s\n",
+                ip.toString().c_str());
+  Serial.println("[OTA] Dans Arduino IDE: Outils > Port > smartchessboard");
 }
 
 void handleOTA() {

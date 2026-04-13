@@ -44,7 +44,7 @@ volatile long g_BO_H8_X = 0, g_BO_H8_Y = 0;
 INA3221 ina(INA3221_ADDR40_GND);
 
 // WiFi + Web
-const char* WIFI_SSID = "";
+const char* WIFI_SSID = "";  // géré via le WebUI → NVS
 const char* WIFI_PASS = "";
 
 const char* AP_SSID = "ESP32-Chessboard";
@@ -85,6 +85,13 @@ volatile bool g_autoMagnetPath = false;
 // Auto calib
 volatile bool g_autoCalibRequested = false;
 volatile bool g_autoCalibStarted   = false;
+
+// Chess Test Run
+volatile bool    g_testRunActive   = false;
+volatile bool    g_testRunAbortReq = false;
+volatile char    g_trStepName[64]  = {};
+volatile uint8_t g_trStepIdx       = 0;
+volatile uint8_t g_trStepTotal     = 0;
 
 // System state
 volatile SystemState g_systemState = SYS_UNHOMED;

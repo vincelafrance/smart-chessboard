@@ -36,8 +36,8 @@ extern unsigned long lastHallPollMs;
 static const long  Y_SPAN_STEPS   = 9300;
 static const long  X_SPAN_STEPS   = 8525;
 
-static const float CALIB_Y_SPEED  = 700.0f;
-static const float CALIB_X_SPEED  = 700.0f;
+static const float CALIB_Y_SPEED  = 2000.0f;
+static const float CALIB_X_SPEED  = 2000.0f;
 
 static const int   CALIB_Y_DIR    = -1;
 static const int   CALIB_X_DIR    = -1;
@@ -183,16 +183,15 @@ static const unsigned long RECENTER_SETTLE_MS = 60;
 
 // Faster piece movement profile (independent from recenter calibration behavior)
 static const float PATH_VMAX_XY = 8600.0f;
-static const float PATH_KP = 2.0f;
+static const float PATH_KP = 8.0f;
 static const float PATH_MIN_VXY = 380.0f;
-static const unsigned long PATH_SETTLE_MS = 35;
-static const unsigned long PATH_PICKUP_SETTLE_MS = 180;
+static const unsigned long PATH_PICKUP_SETTLE_MS = 20;
 
 // Global motor slew limiter.
 // Keep this very short so moves stay snappy while avoiding hard step jumps
 // at launch, stop, and direction reversals.
 static const float MOTION_RAMP_UP_AB   = 70000.0f;
-static const float MOTION_RAMP_DOWN_AB = 280000.0f;
+static const float MOTION_RAMP_DOWN_AB = 450000.0f;
 static const float MOTION_RAMP_STOP_AB = 900000.0f;
 
 // Auto disable
@@ -259,6 +258,15 @@ static const long EDGE_MARGIN_STEPS = 120;
 
 extern volatile bool g_autoCalibRequested;
 extern volatile bool g_autoCalibStarted;
+
+// =======================================================
+// Chess Test Run
+// =======================================================
+extern volatile bool    g_testRunActive;
+extern volatile bool    g_testRunAbortReq;
+extern volatile char    g_trStepName[64];  // current step label
+extern volatile uint8_t g_trStepIdx;       // 0-based step index
+extern volatile uint8_t g_trStepTotal;     // total step count
 
 // =======================================================
 // System state machine

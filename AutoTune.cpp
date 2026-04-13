@@ -1,8 +1,6 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
-// Tableau des décélérations à tester (en steps/s²)
-static const float AT_DECELS[] = {6000.f, 9000.f, 12000.f, 15000.f, 18000.f};
 
 // ============================================================
 // AutoTune.cpp
@@ -91,27 +89,24 @@ static const uint8_t  AT_N_SPEEDS_DIAG      = sizeof(AT_SPEEDS_DIAG)/sizeof(AT_S
 static const float    AT_SPEEDS_AXIS[]      = {7000.f, 9000.f, 11000.f, 12500.f};
 static const uint8_t  AT_N_SPEEDS_AXIS      = sizeof(AT_SPEEDS_AXIS)/sizeof(AT_SPEEDS_AXIS[0]);
 
-// Acceleration default stored in NVS (motion no longer slew-limits, so this is reference-only).
-static const float    AT_ACCELS[]        = {6000.f, 9000.f, 12000.f, 15000.f, 18000.f};
+// Fixed acceleration used during speed-ramp test sessions (not tuned; hardware ramp constants apply at runtime).
+static const float    AT_BASELINE_ACCEL  = 9000.0f;
 
 // Current sweep (mA, low → high).
 // Auto Tune now starts from the lowest current and only climbs if needed.
-static const uint16_t AT_CURRENTS[]       = {700, 750, 850, 950, 1050};
+static const uint16_t AT_CURRENTS[]       = {950, 1050, 1150, 1300, 1500};
 static const uint8_t  AT_N_CURRENTS       = sizeof(AT_CURRENTS)/sizeof(AT_CURRENTS[0]);
 
 // NVS keys
 static const char NVS_NS[]         = "chess_tune";
 static const char NVS_SPEED[]      = "safeSpeed";
 static const char NVS_SPEED_DIAG[] = "safeSpdDiag";
-static const char NVS_ACCEL[]      = "safeAccel";
-static const char NVS_DECEL[]      = "safeDecel";
 static const char NVS_CURRENT[]    = "motorMa";
 static const char NVS_TUNE_OK[]    = "tuneValid";
 static const char NVS_BOUNDS_OK[]  = "boundsValid";
 
 static const float    NVS_DEF_SPEED      = 8600.0f;
 static const float    NVS_DEF_SPEED_DIAG = 6000.0f;
-static const float    NVS_DEF_ACCEL      = 6000.0f;
 static const uint16_t NVS_DEF_CURRENT    = 850;
 
 // ============================================================
@@ -122,8 +117,6 @@ static Preferences  s_prefs;
 
 static void applyTuneCurrentMa(uint16_t mA);
 static void setTuneLiveSettings(float axisSpeed, float diagSpeed, float accel, float decel);
-static bool qualifyCurrentAtBaseline(const char *label, int currentIdx,
-                                     long &refYMin, long &refXMin);
 static float axisSpeedForDiagSpeed(float diagSpeed);
 
 // ============================================================
@@ -159,15 +152,12 @@ void saveSettings() {
     s_prefs.begin(NVS_NS, false);
     s_prefs.putFloat(NVS_SPEED,      g_tuneSettings.safeSpeed);
     s_prefs.putFloat(NVS_SPEED_DIAG, g_tuneSettings.safeSpeedDiag);
-    s_prefs.putFloat(NVS_ACCEL,      g_tuneSettings.safeAccel);
-    s_prefs.putFloat(NVS_DECEL,      g_tuneSettings.safeDecel);
     s_prefs.putUShort(NVS_CURRENT,   g_tuneSettings.motorCurrent);
     s_prefs.putBool(NVS_TUNE_OK,     g_tuneSettings.tuningValid);
     s_prefs.putBool(NVS_BOUNDS_OK,   g_tuneSettings.boundsValid);
     s_prefs.end();
-    Serial.printf("[AT] Saved: axisSpd=%.0f diagSpd=%.0f accel=%.0f decel=%.0f current=%u\n",
+    Serial.printf("[AT] Saved: axisSpd=%.0f diagSpd=%.0f current=%u\n",
                   g_tuneSettings.safeSpeed, g_tuneSettings.safeSpeedDiag,
-                  g_tuneSettings.safeAccel, g_tuneSettings.safeDecel,
                   (unsigned)g_tuneSettings.motorCurrent);
 }
 
@@ -175,22 +165,21 @@ void loadSettings() {
     s_prefs.begin(NVS_NS, true);
     g_tuneSettings.safeSpeed     = s_prefs.getFloat(NVS_SPEED,      NVS_DEF_SPEED);
     g_tuneSettings.safeSpeedDiag = s_prefs.getFloat(NVS_SPEED_DIAG, NVS_DEF_SPEED_DIAG);
-    g_tuneSettings.safeAccel     = s_prefs.getFloat(NVS_ACCEL,      NVS_DEF_ACCEL);
-    g_tuneSettings.safeDecel     = s_prefs.getFloat(NVS_DECEL,      NVS_DEF_ACCEL);
     g_tuneSettings.motorCurrent  = s_prefs.getUShort(NVS_CURRENT,   NVS_DEF_CURRENT);
     g_tuneSettings.tuningValid   = s_prefs.getBool(NVS_TUNE_OK,     false);
     g_tuneSettings.boundsValid   = s_prefs.getBool(NVS_BOUNDS_OK,   false);
     s_prefs.end();
 
+    // Accel/decel are NOT overridden from NVS — hardware ramp constants handle them.
+    g_tuneSettings.safeAccel = 0.0f;
+    g_tuneSettings.safeDecel = 0.0f;
+
     if (g_tuneSettings.tuningValid) {
         g_overrideVmax     = g_tuneSettings.safeSpeed;
         g_overrideDiagVmax = g_tuneSettings.safeSpeedDiag;
-        g_overrideAccel    = g_tuneSettings.safeAccel;
-        g_overrideDecel    = g_tuneSettings.safeDecel;
         setMotionProfileLock(true, AT_LOCKED_MICROSTEPS, g_tuneSettings.motorCurrent);
-        Serial.printf("[AT] Loaded: axisSpd=%.0f diagSpd=%.0f accel=%.0f decel=%.0f current=%u (VALID)\n",
+        Serial.printf("[AT] Loaded: axisSpd=%.0f diagSpd=%.0f current=%u (VALID)\n",
                       g_tuneSettings.safeSpeed, g_tuneSettings.safeSpeedDiag,
-                      g_tuneSettings.safeAccel, g_tuneSettings.safeDecel,
                       (unsigned)g_tuneSettings.motorCurrent);
     } else {
         setMotionProfileLock(false, AT_LOCKED_MICROSTEPS, 0);
@@ -969,43 +958,6 @@ static float axisSpeedForDiagSpeed(float diagSpeed) {
     return axisSpeed;
 }
 
-static bool qualifyCurrentAtBaseline(const char *label, int currentIdx,
-                                     long &refYMin, long &refXMin) {
-    const float baselineAxisSpeed = axisSpeedForDiagSpeed(AT_SPEEDS_DIAG[0]);
-    const float baselineDiagSpeed = AT_SPEEDS_DIAG[0];
-    const float baselineAccel     = AT_ACCELS[0];
-    const float baselineDecel     = AT_DECELS[0];
-
-    applyTuneCurrent(currentIdx);
-    g_overrideDecel = baselineDecel;
-    setTuneLiveSettings(baselineAxisSpeed, baselineDiagSpeed, baselineAccel, baselineDecel);
-
-    atLog("%s: qualifying %u mA at baseline axis=%.0f diag=%.0f accel=%.0f decel=%.0f",
-          label, (unsigned)currentForIndex(currentIdx),
-          baselineAxisSpeed, baselineDiagSpeed, baselineAccel, baselineDecel);
-
-    SessionStats baselineStats;
-    if (!runTrajectorySession(/*quick=*/true, /*axisOnly=*/false,
-                              baselineAxisSpeed, baselineDiagSpeed, baselineAccel,
-                              refYMin, refXMin, baselineStats)) {
-        g_overrideDecel = 0.0f;
-        return false;
-    }
-
-    g_overrideDecel = 0.0f;
-    float baselineScore = computeLevelScore(baselineStats);
-    bool baselineHardFail = (baselineStats.timeouts > 0) ||
-                            (!baselineStats.driftOk) ||
-                            (baselineStats.driftExceeded > 0);
-    bool baselineOk = !baselineHardFail && (baselineScore >= AT_SCORE_PASS_THRESHOLD);
-    atLog("%s: baseline @ %u mA => %s (score=%.2f drift=%.1f timeouts=%u refFails=%u)",
-          label, (unsigned)currentForIndex(currentIdx),
-          baselineOk ? "PASS" : "FAIL",
-          baselineScore, baselineStats.maxDriftTotal,
-          (unsigned)baselineStats.timeouts, (unsigned)baselineStats.driftExceeded);
-    return baselineOk;
-}
-
 static bool runAdaptiveSessionLevel(const char *label,
                                      bool quickMode, bool axisOnly,
                                      float sessionAxisSpeed, float sessionDiagSpeed,
@@ -1013,8 +965,12 @@ static bool runAdaptiveSessionLevel(const char *label,
                                      long &refYMin, long &refXMin,
                                      int &currentIdx,
                                      SessionStats &stats,
-                                     float &scoreOut, bool &levelOkOut) {
-    int retryBudget = (int)AT_N_CURRENTS + 2;
+                                     float &scoreOut, bool &levelOkOut,
+                                     int maxCurrentIdx = (int)AT_N_CURRENTS - 1) {
+    if (maxCurrentIdx < 0) maxCurrentIdx = 0;
+    if (maxCurrentIdx >= (int)AT_N_CURRENTS) maxCurrentIdx = (int)AT_N_CURRENTS - 1;
+
+    int retryBudget = maxCurrentIdx - currentIdx + 3;
     while (!g_tuneAbortReq) {
         if (retryBudget-- <= 0) {
             atLog("%s: aborting adaptive loop after too many retries", label);
@@ -1047,8 +1003,8 @@ static bool runAdaptiveSessionLevel(const char *label,
             return true;
         }
 
-        if (currentIdx >= ((int)AT_N_CURRENTS - 1)) {
-            atLog("%s FAIL even at max safe current %u mA", label, (unsigned)mA);
+        if (currentIdx >= maxCurrentIdx) {
+            atLog("%s FAIL even at current cap %u mA", label, (unsigned)mA);
             g_overrideDecel = 0.0f;
             return true;
         }
@@ -1058,15 +1014,7 @@ static bool runAdaptiveSessionLevel(const char *label,
               label, (unsigned)mA, (unsigned)currentForIndex(strongerIdx));
         currentIdx = strongerIdx;
         applyTuneCurrent(currentIdx);
-        if (!qualifyCurrentAtBaseline(label, currentIdx, refYMin, refXMin)) {
-            if (currentIdx >= ((int)AT_N_CURRENTS - 1)) {
-                atLog("%s: max current could not pass even at baseline settings", label);
-                g_overrideDecel = 0.0f;
-                return false;
-            }
-            vTaskDelay(250 / portTICK_PERIOD_MS);
-            continue;
-        }
+        setTuneLiveSettings(sessionAxisSpeed, sessionDiagSpeed, sessionAccel, sessionDecel);
         vTaskDelay(250 / portTICK_PERIOD_MS);
     }
 
@@ -1074,9 +1022,9 @@ static bool runAdaptiveSessionLevel(const char *label,
     return false;
 }
 
-// Run one Hall-reference check after every trajectory test so Auto Tune can
-// identify weak points as soon as they appear, not only at session end.
-static const uint8_t AT_REF_CHECK_EVERY_TESTS = 1;
+// Intermediate ref checks are performed only after tests flagged highDrift=true
+// (currently only Diag-NE-long — the single most crash-prone trajectory).
+// A mandatory end-of-session check covers cumulative drift for all other tests.
 
 // ──────────────────────────────────────────────────────────────
 // runTrajectorySession()
@@ -1235,11 +1183,8 @@ static bool runTrajectorySession(bool quickMode, bool axisOnly,
         stats.movesRun++;
         vTaskDelay(20 / portTICK_PERIOD_MS);
 
-        // Run a reference check after every completed test so weak trajectories
-        // are identified immediately during Auto Tune.
-        bool periodicRef = (AT_REF_CHECK_EVERY_TESTS > 0) &&
-                           ((stats.movesRun % AT_REF_CHECK_EVERY_TESTS) == 0);
-        if (periodicRef && !g_tuneAbortReq) {
+        // Intermediate ref check only after high-drift tests (Diag-NE-long).
+        if (t.highDrift && !g_tuneAbortReq) {
             if (!doRefCheck(t.name, t.category)) return false;
             if (sessionHardFail) break;
         }
@@ -1282,48 +1227,16 @@ static bool runTrajectorySession(bool quickMode, bool axisOnly,
 // PHASE RUNNERS  (revised to use trajectory sessions)
 // ============================================================
 
-// ---- Phase 2: Repeatability ----
-// Quick suite at a conservative baseline speed; confirms the system is healthy.
-static bool phaseRepeatability(int cycles, long &refYMin, long &refXMin) {
-    setPhaseProgress(AT_PHASE_REPEATABILITY, 0);
-    atLog("=== Phase: Repeatability (%d cycle(s)) ===", cycles);
-
-    float maxDrift = 0.0f;
-    bool  passAll  = true;
-
-    const float baseSpeed = AT_SPEEDS_DIAG[1];  // 5500 steps/s — moderate, tests all directions
-    const float baseAccel = AT_ACCELS[1];        // 10000 steps/s²
-
-    for (int i = 0; i < cycles && !g_tuneAbortReq; i++) {
-        atLog("Repeat pass %d/%d", i + 1, cycles);
-        SessionStats s;
-        if (!runTrajectorySession(/*quick=*/true, /*axisOnly=*/false,
-                                   baseSpeed, baseSpeed, baseAccel, refYMin, refXMin, s)) return false;
-
-        if (s.maxDriftTotal > maxDrift) maxDrift = s.maxDriftTotal;
-        if (!s.driftOk || s.timeouts > 0) {
-            passAll = false;
-            atLog("Pass %d WARN: drift=%.1f(Y:%.1f X:%.1f) timeouts=%u",
-                  i + 1, s.maxDriftTotal, s.maxDriftY, s.maxDriftX, (unsigned)s.timeouts);
-            for (uint8_t c = 0; c < TC_NUM; c++) {
-                if (s.catFails[c]) atLog("  cat %s: %u fails", TC_NAMES[c], (unsigned)s.catFails[c]);
-            }
-        }
-        setPhaseProgress(AT_PHASE_REPEATABILITY, (int)(100.0f * (i + 1) / cycles));
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
-
-    atLog("Repeatability: maxDrift=%.1f  %s", maxDrift, passAll ? "PASS" : "WARN");
-    return true;
-}
 
 // ---- Phase 3a: Diagonal Speed Ramp ----
 // Uses the full quick suite (axis + diagonal moves).
 // Limited by diagonal performance: one motor runs at √2× carriage speed.
 // Returns the safe carriage speed for diagonal moves.
 static float phaseSpeedRampDiag(long refYMin, long refXMin, float baseAccel,
-                                int &currentIdx) {
-    setPhaseProgress(AT_PHASE_SPEED_RAMP, 0);
+                                int &currentIdx,
+                                int maxCurrentIdx = (int)AT_N_CURRENTS - 1,
+                                TunePhase phase = AT_PHASE_SPEED_RAMP) {
+    setPhaseProgress(phase, 0);
     atLog("=== Phase: Diagonal Speed Ramp (%d levels) ===", (int)AT_N_SPEEDS_DIAG);
 
     float lastGoodSpeed = AT_SPEEDS_DIAG[0];
@@ -1343,7 +1256,8 @@ static float phaseSpeedRampDiag(long refYMin, long refXMin, float baseAccel,
         bool  levelOk = false;
         if (!runAdaptiveSessionLevel(label, /*quick=*/true, /*axisOnly=*/false,
                                      axisSpeed, speed, baseAccel, /*decel=*/0.0f,
-                                     refYMin, refXMin, currentIdx, s, score, levelOk)) {
+                                     refYMin, refXMin, currentIdx, s, score, levelOk,
+                                     maxCurrentIdx)) {
             atLog("Diag speed ramp aborted during adaptive current recovery");
             return 0.0f;
         }
@@ -1361,7 +1275,7 @@ static float phaseSpeedRampDiag(long refYMin, long refXMin, float baseAccel,
         lastGoodSpeed = speed;
         lastGoodScore = score;
         anyPass = true;
-        setPhaseProgress(AT_PHASE_SPEED_RAMP, (int)(50.0f * (si + 1) / AT_N_SPEEDS_DIAG));
+        setPhaseProgress(phase, (int)(50.0f * (si + 1) / AT_N_SPEEDS_DIAG));
     }
 
     float margin = graduatedMargin(lastGoodScore);
@@ -1378,7 +1292,9 @@ static float phaseSpeedRampDiag(long refYMin, long refXMin, float baseAccel,
 // Returns the safe carriage speed for axis-only moves.
 static float phaseSpeedRampAxis(long refYMin, long refXMin,
                                  float diagSafeSpeed, float baseAccel,
-                                 int &currentIdx) {
+                                 int &currentIdx,
+                                 int maxCurrentIdx = (int)AT_N_CURRENTS - 1,
+                                 TunePhase phase = AT_PHASE_SPEED_RAMP) {
     atLog("=== Phase: Axis Speed Extension (above %.0f) ===", diagSafeSpeed);
 
     // Find the first AT_SPEEDS_AXIS level above the diagonal safe speed.
@@ -1389,7 +1305,7 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
 
     if (startIdx >= (int)AT_N_SPEEDS_AXIS) {
         atLog("Axis ramp: no levels above diag safe speed — using diagSafe=%.0f as axis speed", diagSafeSpeed);
-        setPhaseProgress(AT_PHASE_SPEED_RAMP, 100);
+        setPhaseProgress(phase, 100);
         return diagSafeSpeed;  // already as fast as axis allows at this range
     }
 
@@ -1409,7 +1325,8 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
         bool  levelOk = false;
         if (!runAdaptiveSessionLevel(label, /*quick=*/true, /*axisOnly=*/true,
                                      speed, diagSafeSpeed, baseAccel, /*decel=*/0.0f,
-                                     refYMin, refXMin, currentIdx, s, score, levelOk)) {
+                                     refYMin, refXMin, currentIdx, s, score, levelOk,
+                                     maxCurrentIdx)) {
             atLog("Axis speed ramp aborted during adaptive current recovery");
             return diagSafeSpeed;
         }
@@ -1422,7 +1339,7 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
         }
         lastGoodSpeed = speed;
         lastGoodScore = score;
-        setPhaseProgress(AT_PHASE_SPEED_RAMP,
+        setPhaseProgress(phase,
                           50 + (int)(50.0f * (si - startIdx + 1) / numTested));
     }
 
@@ -1431,7 +1348,7 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
     if (result < diagSafeSpeed) result = diagSafeSpeed;  // never go below diagonal safe
     atLog("Axis speed done: lastGood=%.0f score=%.2f margin=%.2f safe=%.0f",
           lastGoodSpeed, lastGoodScore, margin, result);
-    setPhaseProgress(AT_PHASE_SPEED_RAMP, 100);
+    setPhaseProgress(phase, 100);
     return result;
 }
 
@@ -1442,7 +1359,7 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
 // Score is logged per level for diagnostics.  If the last good level had
 // a low score (borderline pass), the log will indicate which categories
 // were the cause.
-static uint16_t phaseCurrentTune(long refYMin, long refXMin,
+static uint16_t phaseCurrentTune(long &refYMin, long &refXMin,
                                    int startCurrentIdx,
                                    float safeSpeedAxis, float safeSpeedDiag, float safeAccel,
                                    float safeDecel) {
@@ -1512,7 +1429,7 @@ static uint16_t phaseCurrentTune(long refYMin, long refXMin,
 }
 
 // ---- Phase 6: Final characterisation at tuned params (quick suite) ----
-static bool phaseFinalCharacterize(long refYMin, long refXMin,
+static bool phaseFinalCharacterize(long &refYMin, long &refXMin,
                                     float safeSpeedAxis, float safeSpeedDiag, float safeAccel,
                                     float safeDecel, uint16_t safeCurrent) {
     setPhaseProgress(AT_PHASE_APPROACH, 0);  // reuse APPROACH slot for this phase
@@ -1550,7 +1467,7 @@ static bool phaseFinalCharacterize(long refYMin, long refXMin,
     return finalOk;
 }
 
-static void reclaimFinalSpeeds(long refYMin, long refXMin,
+static void reclaimFinalSpeeds(long &refYMin, long &refXMin,
                                float &safeSpeedAxis, float &safeSpeedDiag,
                                float safeAccel, float safeDecel,
                                uint16_t safeCurrent) {
@@ -1600,12 +1517,15 @@ static void reclaimFinalSpeeds(long refYMin, long refXMin,
     }
 }
 
-static bool stabilizeFinalSettings(long refYMin, long refXMin,
+static bool stabilizeFinalSettings(long &refYMin, long &refXMin,
                                    float &safeSpeedAxis, float &safeSpeedDiag,
                                    float &safeAccel, float &safeDecel,
                                    uint16_t &safeCurrent) {
     const uint16_t maxSafeCurrent = currentForIndex((int)AT_N_CURRENTS - 1);
+    const float origSpeedAxis = safeSpeedAxis;
+    const float origSpeedDiag = safeSpeedDiag;
 
+    // Step 1: Try at current (tuned) settings
     if (phaseFinalCharacterize(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
                                safeDecel, safeCurrent)) {
         reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
@@ -1613,6 +1533,7 @@ static bool stabilizeFinalSettings(long refYMin, long refXMin,
         return true;
     }
 
+    // Step 2: Bump to max current and retry
     if (safeCurrent < maxSafeCurrent) {
         atLog("Final validation failed at %u mA -> retrying at max safe current %u mA",
               (unsigned)safeCurrent, (unsigned)maxSafeCurrent);
@@ -1625,31 +1546,30 @@ static bool stabilizeFinalSettings(long refYMin, long refXMin,
         }
     }
 
-    for (int attempt = 1; attempt <= 5 && !g_tuneAbortReq; attempt++) {
-        if (attempt <= 3) {
-            safeAccel *= 0.86f;
-            safeDecel *= 0.86f;
-        } else {
-            safeSpeedDiag *= 0.94f;
-            safeSpeedAxis *= 0.96f;
-            if (safeSpeedAxis < safeSpeedDiag) safeSpeedAxis = safeSpeedDiag;
-            safeAccel *= 0.92f;
-            safeDecel *= 0.92f;
-        }
+    // Step 3: Step down from 90% to 50% of tuned speed until a level passes.
+    // Each passing level is saved as the new safe setting; reclaim then tries to push back up.
+    static const float SPEED_STEPS[] = { 0.90f, 0.80f, 0.70f, 0.60f, 0.50f };
+    for (int i = 0; i < 5 && !g_tuneAbortReq; i++) {
+        float ratio = SPEED_STEPS[i];
+        safeSpeedDiag = origSpeedDiag * ratio;
+        safeSpeedAxis = origSpeedAxis * ratio;
+        if (safeSpeedAxis < safeSpeedDiag) safeSpeedAxis = safeSpeedDiag;
 
-        atLog("Stabilisation step %d: axis=%.0f diag=%.0f accel=%.0f decel=%.0f current=%u",
-              attempt, safeSpeedAxis, safeSpeedDiag, safeAccel, safeDecel, (unsigned)safeCurrent);
+        atLog("Stabilisation step %d/5: %.0f%% speed (axis=%.0f diag=%.0f current=%u)",
+              i + 1, ratio * 100.0f, safeSpeedAxis, safeSpeedDiag, (unsigned)safeCurrent);
 
         if (phaseFinalCharacterize(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
                                    safeDecel, safeCurrent)) {
-            atLog("Stabilisation success after %d backoff step(s)", attempt);
+            atLog("Stabilisation: stable at %.0f%% of tuned speed (axis=%.0f diag=%.0f)",
+                  ratio * 100.0f, safeSpeedAxis, safeSpeedDiag);
             reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
                                safeDecel, safeCurrent);
             return true;
         }
     }
 
-    atLog("Stabilisation could not eliminate final FAILs");
+    // Nothing passed even at 50% — caller will save the 50% floor as a last resort
+    atLog("Stabilisation: no stable configuration found down to 50%% of tuned speed");
     return false;
 }
 
@@ -1668,6 +1588,7 @@ static bool runTuneSequence() {
     }
 
     g_driftCount = 0;
+    memset(bannedTests, 0, sizeof(bannedTests));  // clear bans from any previous run
 
     // ---- Phase 1: Establish reference ----
     setPhaseProgress(AT_PHASE_REFERENCE, 0);
@@ -1691,7 +1612,7 @@ static bool runTuneSequence() {
     atLog("Adaptive current start: %u mA", (unsigned)currentForIndex(currentIdx));
 
     // ---- Phase 2: Speed Ramp (diagonal then axis) ----
-    const float testAccelBase = AT_ACCELS[1];  // 10000 steps/s² (conservative)
+    const float testAccelBase = AT_BASELINE_ACCEL;
 
     float safeSpeedDiag = phaseSpeedRampDiag(refYMin, refXMin, testAccelBase, currentIdx);
     if (safeSpeedDiag <= 0.0f) {
@@ -1708,82 +1629,81 @@ static bool runTuneSequence() {
     float safeSpeedAxis = phaseSpeedRampAxis(refYMin, refXMin, safeSpeedDiag, testAccelBase, currentIdx);
     if (g_tuneAbortReq) return false;
 
-    // ---- Phase 4: Acceleration Ramp (snappy accel selection) ----
-    float lastGoodAccel = AT_ACCELS[0];
-    float lastGoodScore = 1.0f;
-    bool  anyAccelPass = false;
-    for (int ai = 0; ai < (int)(sizeof(AT_ACCELS)/sizeof(AT_ACCELS[0])) && !g_tuneAbortReq; ai++) {
-        float accel = AT_ACCELS[ai];
-        char label[64];
-        snprintf(label, sizeof(label), "Accel level %d/%d: %.0f steps/s²",
-                 ai + 1, (int)(sizeof(AT_ACCELS)/sizeof(AT_ACCELS[0])), accel);
-        atLog("%s", label);
-        SessionStats s;
-        float score = 0.0f;
-        bool levelOk = false;
-        if (!runAdaptiveSessionLevel(label, /*quick=*/true, /*axisOnly=*/false,
-                                     safeSpeedAxis, safeSpeedDiag, accel, /*decel=*/0.0f,
-                                     refYMin, refXMin, currentIdx, s, score, levelOk)) {
-            atLog("ABORT: acceleration tuning could not recover to a working baseline");
-            return false;
-        }
-        if (!levelOk) {
-            if (!anyAccelPass) {
-                atLog("Accel ramp: even the lowest acceleration could not be validated");
-                return false;
+    // ---- Efficiency comparison: re-run speed ramp capped at one current level below ----
+    // If the lower-current result still achieves >= 90% of the higher-current speed for
+    // both axis and diagonal, it is more efficient (less heat, longer battery life).
+    // In that case we accept the lower-current result as the winner.
+    {
+        const float speedDiagHigh  = safeSpeedDiag;
+        const float speedAxisHigh  = safeSpeedAxis;
+        const int   currentIdxHigh = currentIdx;
+
+        if (currentIdxHigh > 0 && !g_tuneAbortReq) {
+            const int capIdx = currentIdxHigh - 1;
+            int currentIdxLow = 0;
+
+            portENTER_CRITICAL(&gMux);
+            refYMin = g_yHardMin;
+            refXMin = g_xHardMin;
+            portEXIT_CRITICAL(&gMux);
+
+            atLog("=== Efficiency check: re-running speed ramp capped at %u mA ===",
+                  (unsigned)currentForIndex(capIdx));
+
+            setPhaseProgress(AT_PHASE_ACCEL_RAMP, 0);
+            float speedDiagLow = phaseSpeedRampDiag(refYMin, refXMin, testAccelBase,
+                                                     currentIdxLow, capIdx, AT_PHASE_ACCEL_RAMP);
+            float speedAxisLow = speedDiagLow;
+
+            if (speedDiagLow > 0.0f && !g_tuneAbortReq) {
+                portENTER_CRITICAL(&gMux);
+                refYMin = g_yHardMin;
+                refXMin = g_xHardMin;
+                portEXIT_CRITICAL(&gMux);
+                speedAxisLow = phaseSpeedRampAxis(refYMin, refXMin, speedDiagLow,
+                                                  testAccelBase, currentIdxLow, capIdx,
+                                                  AT_PHASE_ACCEL_RAMP);
             }
-            break;
-        }
-        lastGoodAccel = accel;
-        lastGoodScore = score;
-        anyAccelPass = true;
-    }
-    float accelMargin = graduatedMargin(lastGoodScore);
-    float safeAccel = lastGoodAccel * accelMargin;
-    atLog("Accel ramp done: lastGood=%.0f score=%.2f margin=%.2f safe=%.0f", lastGoodAccel, lastGoodScore, accelMargin, safeAccel);
 
-    portENTER_CRITICAL(&gMux);
-    refYMin = g_yHardMin;
-    refXMin = g_xHardMin;
-    portEXIT_CRITICAL(&gMux);
+            atLog("Efficiency: HIGH %u mA => diag=%.0f axis=%.0f",
+                  (unsigned)currentForIndex(currentIdxHigh), speedDiagHigh, speedAxisHigh);
+            atLog("Efficiency: LOW  %u mA => diag=%.0f axis=%.0f",
+                  (unsigned)currentForIndex(capIdx), speedDiagLow, speedAxisLow);
 
+            const float diagRatio = (speedDiagHigh > 0.0f) ? (speedDiagLow / speedDiagHigh) : 0.0f;
+            const float axisRatio = (speedAxisHigh > 0.0f) ? (speedAxisLow / speedAxisHigh) : 0.0f;
+            atLog("Efficiency ratios: diag=%.2f axis=%.2f (threshold 0.90)", diagRatio, axisRatio);
 
-    // ---- Phase 4b: Deceleration Ramp (snappy decel selection) ----
-    float lastGoodDecel = AT_DECELS[0];
-    float lastGoodDecelScore = 1.0f;
-    bool  anyDecelPass = false;
-    for (int di = 0; di < (int)(sizeof(AT_DECELS)/sizeof(AT_DECELS[0])) && !g_tuneAbortReq; di++) {
-        float decel = AT_DECELS[di];
-        char label[64];
-        snprintf(label, sizeof(label), "Decel level %d/%d: %.0f steps/s²",
-                 di + 1, (int)(sizeof(AT_DECELS)/sizeof(AT_DECELS[0])), decel);
-        atLog("%s", label);
-        SessionStats s;
-        float score = 0.0f;
-        bool levelOk = false;
-        if (!runAdaptiveSessionLevel(label, /*quick=*/true, /*axisOnly=*/false,
-                                     safeSpeedAxis, safeSpeedDiag, safeAccel, decel,
-                                     refYMin, refXMin, currentIdx, s, score, levelOk)) {
-            atLog("ABORT: deceleration tuning could not recover to a working baseline");
-            return false;
-        }
-        if (!levelOk) {
-            if (!anyDecelPass) {
-                atLog("Decel ramp: even the lowest deceleration could not be validated");
-                return false;
+            if (speedDiagLow > 0.0f && diagRatio >= 0.90f && axisRatio >= 0.90f) {
+                atLog("Efficiency: LOW current is >= 90%% as fast on both axes — using %u mA",
+                      (unsigned)currentForIndex(capIdx));
+                safeSpeedDiag = speedDiagLow;
+                safeSpeedAxis = speedAxisLow;
+                currentIdx    = currentIdxLow;
+            } else {
+                atLog("Efficiency: HIGH current wins (diag=%.2f axis=%.2f) — keeping %u mA",
+                      diagRatio, axisRatio, (unsigned)currentForIndex(currentIdxHigh));
+                safeSpeedDiag = speedDiagHigh;
+                safeSpeedAxis = speedAxisHigh;
+                currentIdx    = currentIdxHigh;
+                portENTER_CRITICAL(&gMux);
+                refYMin = g_yHardMin;
+                refXMin = g_xHardMin;
+                portEXIT_CRITICAL(&gMux);
             }
-            break;
         }
-        lastGoodDecel = decel;
-        lastGoodDecelScore = score;
-        anyDecelPass = true;
     }
-    float decelMargin = graduatedMargin(lastGoodDecelScore);
-    float safeDecel = lastGoodDecel * decelMargin;
-    atLog("Decel ramp done: lastGood=%.0f score=%.2f margin=%.2f safe=%.0f", lastGoodDecel, lastGoodDecelScore, decelMargin, safeDecel);
+    if (g_tuneAbortReq) return false;
 
-    atLog("Adaptive ramps settled at %u mA before final current minimisation",
-          (unsigned)currentForIndex(currentIdx));
+    // ---- Phase 4: Accel/Decel — not tuned; hardware ramp constants used at runtime ----
+    // safeAccel/safeDecel stay 0.0f (no override) so MOTION_RAMP_UP_AB / MOTION_RAMP_DOWN_AB apply.
+    float safeAccel = 0.0f;
+    float safeDecel = 0.0f;
+    setPhaseProgress(AT_PHASE_ACCEL_RAMP, 100);
+    atLog("=== Phase: Accel/Decel — fixed hardware ramp constants (not tuned) ===");
+    atLog("Ramp up=%.0f down=%.0f stop=%.0f steps/s² (from firmware constants)",
+          (float)MOTION_RAMP_UP_AB, (float)MOTION_RAMP_DOWN_AB, (float)MOTION_RAMP_STOP_AB);
+    atLog("Current at accel/decel skip: %u mA", (unsigned)currentForIndex(currentIdx));
 
     // ---- Phase 5: Current Sweep (step down from the adaptive current) ----
     uint16_t safeCurrent = phaseCurrentTune(refYMin, refXMin, currentIdx,
@@ -1796,28 +1716,29 @@ static bool runTuneSequence() {
     portEXIT_CRITICAL(&gMux);
 
     // ---- Phase 6: Final characterisation / stabilisation at tuned params ----
-    if (!stabilizeFinalSettings(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag,
-                                safeAccel, safeDecel, safeCurrent)) {
-        if (g_tuneAbortReq) return false;
-        atLog("ABORT: unable to stabilise tuned settings without FAIL");
-        return false;
-    }
+    bool stabOk = stabilizeFinalSettings(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag,
+                                         safeAccel, safeDecel, safeCurrent);
     if (g_tuneAbortReq) return false;
+    if (!stabOk) {
+        atLog("WARNING: final stabilisation could not pass at any tested speed level");
+        atLog("  Saving conservative floor settings (axis=%.0f diag=%.0f current=%u)",
+              safeSpeedAxis, safeSpeedDiag, (unsigned)safeCurrent);
+    }
+    setPhaseProgress(AT_PHASE_APPROACH, 100);
 
     // ---- Apply and persist results ----
 
     g_tuneSettings.safeSpeed     = safeSpeedAxis;
     g_tuneSettings.safeSpeedDiag = safeSpeedDiag;
-    g_tuneSettings.safeAccel     = safeAccel;
-    g_tuneSettings.safeDecel     = safeDecel;
+    g_tuneSettings.safeAccel     = 0.0f;  // not tuned; firmware ramp constants apply
+    g_tuneSettings.safeDecel     = 0.0f;  // not tuned; firmware ramp constants apply
     g_tuneSettings.motorCurrent  = safeCurrent;
     g_tuneSettings.tuningValid   = true;
     g_tuneSettings.boundsValid   = true;
 
     g_overrideVmax     = safeSpeedAxis;
     g_overrideDiagVmax = safeSpeedDiag;
-    g_overrideAccel    = safeAccel;
-    g_overrideDecel    = safeDecel;
+    // g_overrideAccel and g_overrideDecel left at 0 — hardware constants used
     setMotionProfileLock(true, AT_LOCKED_MICROSTEPS, safeCurrent);
     applyTuneCurrentMa(safeCurrent);
     saveSettings();
@@ -1863,8 +1784,7 @@ static void autoTuneTaskFn(void *param) {
                          g_tuneSettings.tuningValid ? g_tuneSettings.motorCurrent : 0);
     g_overrideVmax     = g_tuneSettings.tuningValid ? g_tuneSettings.safeSpeed     : 0.0f;
     g_overrideDiagVmax = g_tuneSettings.tuningValid ? g_tuneSettings.safeSpeedDiag : 0.0f;
-    g_overrideAccel    = g_tuneSettings.tuningValid ? g_tuneSettings.safeAccel     : 0.0f;
-    g_overrideDecel    = g_tuneSettings.tuningValid ? g_tuneSettings.safeDecel     : 0.0f;
+    // g_overrideAccel / g_overrideDecel left at 0 — hardware ramp constants apply
     s_taskHandle    = nullptr;
     vTaskDelete(nullptr);
 }

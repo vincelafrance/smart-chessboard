@@ -12,6 +12,7 @@
 #include "DriversUART.h"
 #include "AutoTune.h"
 #include "ChessTestRun.h"
+#include "CalibNVS.h"
 
 unsigned long lastBattMs = 0;
 unsigned long lastPushMs = 0;
@@ -55,13 +56,21 @@ void setup() {
   // Init globals
   initGlobals();
 
-  // Board mapping initial (center target)
-  long cx, cy;
-  portENTER_CRITICAL(&gMux);
-  cx = g_xCenterTarget;
-  cy = g_yCenterTarget;
-  portEXIT_CRITICAL(&gMux);
-  boardUpdateFromOrigin(cx, cy);
+  // Restore calibration data from NVS.  If found, recompute board boundaries
+  // from the saved corners directly.  If not found, fall back to the default
+  // origin-based initialisation so the system is in a usable state before the
+  // first physical calibration run.
+  bool calibLoaded = loadCalibFromNVS();
+  if (calibLoaded) {
+    boardUpdateFromCorners();   // recompute BO_ boundaries from restored corners
+  } else {
+    long cx, cy;
+    portENTER_CRITICAL(&gMux);
+    cx = g_xCenterTarget;
+    cy = g_yCenterTarget;
+    portEXIT_CRITICAL(&gMux);
+    boardUpdateFromOrigin(cx, cy);
+  }
 
   // WiFi + Web
   startWiFi();
@@ -114,6 +123,22 @@ void loop() {
     g_battI = i;
     g_battPct = pct;
     portEXIT_CRITICAL(&gMux);
+  }
+
+  // Deferred NVS calibration save — triggered 3 s after the last mutation,
+  // only when no path or calibration is in flight.  Runs in a one-shot
+  // background task so loop() / webLoop() are never blocked by flash writes.
+  if (g_calibNvsDirty && (now - g_calibNvsDirtyMs >= 3000)
+      && !g_pathActive && (g_calibState == CALIB_IDLE)) {
+    g_calibNvsDirty = false;
+    xTaskCreate([](void*){ saveCalibToNVS(); vTaskDelete(nullptr); },
+                "nvsSave", 4096, nullptr, 1, nullptr);
+  }
+
+  // Immediate push requested by onWsEvent when a new client connects.
+  if (g_wsPushPending) {
+    g_wsPushPending = false;
+    webPushTelemetry();
   }
 
   // Push telemetry

@@ -170,6 +170,7 @@ void abortPath() {
   g_wpCount = 0;
   g_wpIndex = 0;
   g_autoMagnetPath = false;
+  g_dzPathYExpanded = false;  // abort clears the dead-zone path limit expansion
   portEXIT_CRITICAL(&gMux);
 }
 

@@ -124,6 +124,12 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 }
 
 .sq.check{box-shadow:inset 0 0 0 3px rgba(255,80,80,0.95);}
+.sq.calibCorner{box-shadow:inset 0 0 0 3px #f9ca24;cursor:pointer;}
+.sq.calibCornerActive{background:#f9ca24 !important;color:#000 !important;box-shadow:none;}
+.sq.calibCornerDirty{background:#ff6b6b !important;color:#fff !important;box-shadow:none;}
+.sq.calibDim{opacity:.2;pointer-events:none;}
+#calibValidate.calib-dirty{background:#ff6b6b !important;color:#fff !important;}
+#calibValidate.calib-ok{background:#1dd1a1 !important;color:#000 !important;}
 </style>
 </head>
 <body>
@@ -177,8 +183,19 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         <button id="down">⬇️</button>
 
         <div style="margin-top:6px; display:flex; gap:10px; flex-wrap:wrap;">
+                  <!-- Mode calibration avancée UX guidée — utilise les flèches existantes -->
+                  <div id="calibMovePanel" style="display:none;flex-direction:column;align-items:center;width:100%;margin-top:10px;gap:8px;background:#0e1522;padding:14px 12px;border-radius:14px;border:2px solid #1dd1a1;">
+                    <div id="calibStepTitle" style="font-weight:700;font-size:16px;color:#1dd1a1;">Calibration avancée</div>
+                    <div id="calibStepMsg" style="font-size:13px;opacity:.85;text-align:center;">Suivez les instructions pour positionner le chariot précisément.</div>
+                    <div style="display:flex;gap:8px;margin-top:4px;">
+                      <button class="mini" id="calibValidate" style="background:#1dd1a1;color:#000;font-weight:700;">Valider cette position</button>
+                      <button class="mini" id="calibCancel">Annuler</button>
+                    </div>
+                    <div id="calibStepFeedback" style="font-size:13px;min-height:16px;color:#1dd1a1;text-align:center;"></div>
+                  </div>
           <button class="mini" id="center">Recentrer</button>
-          <button class="mini" id="calibBtn">🎯 Calibration</button>
+          <button class="mini" id="calibBtn">🎯 Calibration auto</button>
+          <button class="mini" id="calibAdvanced">Calibration avancée</button>
           <button class="mini" id="diag4Btn">🧭 Test 1-2-3-4</button>
           <button class="mini" id="magnetBtn">🧲 Electroaimant: OFF</button>
           <button class="mini" id="tuneBtn">⚙️ Auto Tune</button>
@@ -264,12 +281,21 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         <div>
           <div style="font-weight:700;margin-bottom:6px;">Sélection des cases</div>
           <div class="legend">Tap sur une pièce = FROM (bleu). Puis tap destination = TO (vert) pour envoyer le coup.</div>
-<div class="boardWrap" id="boardWrap">
-        <div id="turnOverlay" class="turnOverlay white">Tour: Blancs</div>
-
-        <div id="board" class="board"></div>
-  <div id="boardLoading" class="boardLoading">Calibration en cours…</div>
-      </div>
+          <div class="boardWrap" id="boardWrap">
+            <div id="turnOverlay" class="turnOverlay white">Tour: Blancs</div>
+            <div id="board" class="board"></div>
+            <div id="boardLoading" class="boardLoading">Calibration en cours…</div>
+          </div>
+          <!-- Boutons dead zones calibration sous le board -->
+          <div id="deadZoneCalibPanel" style="display:none;flex-direction:column;gap:10px;margin-top:14px;">
+            <div style="font-size:12px;opacity:.7;text-align:center;">Blancs = gauche &nbsp;|&nbsp; Noirs = droite</div>
+            <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+              <button class="mini" id="calibDZL_Bas"  style="background:#222;border:2px solid #54a0ff;">⬇️ G bas (slot 15)</button>
+              <button class="mini" id="calibDZL_Haut" style="background:#222;border:2px solid #54a0ff;">⬆️ G haut (slot 0)</button>
+              <button class="mini" id="calibDZR_Bas"  style="background:#222;border:2px solid #f9ca24;">⬇️ D bas (slot 15)</button>
+              <button class="mini" id="calibDZR_Haut" style="background:#222;border:2px solid #f9ca24;">⬆️ D haut (slot 0)</button>
+            </div>
+          </div>
         </div>
         <div style="min-width:220px;">
           <div class="pill">
@@ -289,11 +315,8 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 
     <div class="card">
       <h1>📡 WiFi</h1>
-      <div style="font-size:13px;opacity:.75;margin-bottom:14px;">
-        Connecte l'ESP32 à ton réseau maison pour accéder au WebUI depuis n'importe quel appareil sans changer de WiFi.
-        Une fois connecté, utilise <b>http://smartchessboard.local</b> ou l'IP affichée dans le port série.
-      </div>
-      <div style="display:flex;flex-direction:column;gap:10px;">
+      <div id="wifiStatusBadge" style="margin-bottom:12px;font-size:13px;opacity:.85;">—</div>
+      <div id="wifiForm" style="display:flex;flex-direction:column;gap:10px;">
         <div>
           <div class="label" style="margin-bottom:5px;">Nom du réseau (SSID)</div>
           <input id="wifiSsid" type="text" placeholder="MonWiFi" autocomplete="off" autocorrect="off" spellcheck="false"
@@ -304,13 +327,14 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
           <input id="wifiPass" type="password" placeholder="••••••••" autocomplete="new-password"
             style="width:100%;box-sizing:border-box;background:#0e1522;border:1px solid #1f2a3a;border-radius:10px;padding:10px 12px;color:#e8eef6;font-size:14px;outline:none;"/>
         </div>
-        <button class="mini" id="wifiSaveBtn" style="margin-top:2px;width:100%;">💾 Sauvegarder et redémarrer</button>
+        <button class="mini" id="wifiSaveBtn" style="width:100%;">💾 Sauvegarder et redémarrer</button>
         <div id="wifiMsg" style="font-size:12px;min-height:16px;"></div>
       </div>
     </div>
   </div>
 
 <script>
+  console.log("[SC] script start");
   const statusEl = document.getElementById("status");
   const pctEl = document.getElementById("pct");
   const fillEl = document.getElementById("fill");
@@ -513,10 +537,21 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   }
 
   const wsUrl = `ws://${location.hostname}:81/`;
+  console.log("[SC] wsUrl =", wsUrl);
   let ws;
+  connect();  // hoisted — starts WebSocket before any optional element bindings can throw
 
   function send(obj){
     if(!ws || ws.readyState !== WebSocket.OPEN) return;
+    // If the user moves the carriage with arrows while a corner is selected,
+    // mark the position as modified (dirty).
+    const calibHasTarget = calibCornerMode && calibStep && calibStep !== "advanced";
+    if(calibHasTarget && obj.cmd === "move"
+       && obj.dir && obj.dir !== "stop" && obj.dir !== "center"){
+      console.log("[calib] arrow pressed with target — marking dirty. step=" + calibStep + " dir=" + obj.dir);
+      setCalibDirty(true);
+      renderBoard();
+    }
     ws.send(JSON.stringify(obj));
   }
   function setActive(btn){
@@ -566,6 +601,19 @@ const fromTxt = document.getElementById("fromTxt");
 
   let from = null;
   let to   = null;
+  let calibCornerMode = false;
+  let selectedCalibCorner = null; // {f, r, which} when a corner is active
+  let calibCornerDirty = false;   // true once user moves arrows after selecting a corner
+  let calibStep = null;           // current calibration point: "a1","h1","a8","h8", dz key, "advanced", or null
+
+  function setCalibDirty(dirty) {
+    console.log("[calib] setCalibDirty(" + dirty + ") — step=" + calibStep + " corner=" + (selectedCalibCorner ? selectedCalibCorner.which : "none"));
+    calibCornerDirty = dirty;
+    const btn = document.getElementById("calibValidate");
+    if (!btn) return;
+    btn.classList.toggle("calib-dirty", dirty);
+    btn.classList.toggle("calib-ok", !dirty && !!selectedCalibCorner);
+  }
 
   function labelOf(s){
     if(!s) return "--";
@@ -1044,7 +1092,7 @@ let resetTargetBoard = null;
     const opp2 = (c === 'w') ? 'b' : 'w';
     const oppKing = findKing(next, opp2);
     const givesCheck = (oppKing && isSquareAttacked(next, oppKing, c)) ? true : false;
-    return {ok:true, nextBoard: next, givesCheck, epNext, rightsUpdate};
+    return {ok:true, nextBoard: next, givesCheck, epNext, rightsUpdate, epCaptureSq};
   }
 
 
@@ -1325,7 +1373,42 @@ const pid = boardState[key];
       if(from && from.f===f && from.r===r) div.classList.add("selFrom");
       if(to   && to.f===f   && to.r===r)   div.classList.add("selTo");
 
+      // Calibration corner mode overlay
+      if(calibCornerMode){
+        const isCorner=(f===0&&r===1)||(f===7&&r===1)||(f===0&&r===8)||(f===7&&r===8);
+        if(isCorner){
+          const isSelected = selectedCalibCorner && selectedCalibCorner.f===f && selectedCalibCorner.r===r;
+          if(isSelected){
+            div.classList.add(calibCornerDirty ? "calibCornerDirty" : "calibCornerActive");
+          } else {
+            div.classList.add("calibCorner");
+          }
+        } else {
+          div.classList.add("calibDim");
+        }
+      }
+
       div.addEventListener("pointerup", (e)=>{
+        // In calibration corner mode: only allow selecting the 4 corners
+        if(calibCornerMode){
+          const isCorner=(f===0&&r===1)||(f===7&&r===1)||(f===0&&r===8)||(f===7&&r===8);
+          if(isCorner){
+            const whichMap={};
+            whichMap[sqKey(0,1)]="a1"; whichMap[sqKey(7,1)]="h1";
+            whichMap[sqKey(0,8)]="a8"; whichMap[sqKey(7,8)]="h8";
+            selectedCalibCorner = {f, r, which: whichMap[key]};
+            calibStep = whichMap[key];
+            calibCornerDirty = false;
+            setCalibDirty(false);
+            console.log("[calib] corner clicked → " + calibStep + " f=" + f + " r=" + r + " sending gotoSquare");
+            send({cmd:"gotoSquare", f:f, r:r});
+            renderBoard();
+            updateCalibStepUI();
+          } else {
+            console.log("[calib] clicked f=" + f + " r=" + r + " — not a corner, ignored");
+          }
+          return;
+        }
         if(resetInProgress){
           setStatus("Reset en cours, attends la fin des déplacements.", false);
           return;
@@ -1383,6 +1466,17 @@ const pid = boardState[key];
   }
 }
 
+  // Send a dead-zone move for a captured piece then track it in the UI state.
+  // Must be called BEFORE the capturing piece's move command so the queue
+  // executes them in order: clear the square, then occupy it.
+  function sendCaptureToDeadZone(capturedPid, f, r) {
+    if (!capturedPid) return;
+    const side = pieceColor(capturedPid) === 'w' ? 'L' : 'R';
+    const slot = side === 'L' ? deadZones.nextL : deadZones.nextR;
+    if (slot >= 0) send({cmd:"deadZoneMove", ff:f, fr:r, side, slot});
+    addToCapturedZone(capturedPid, side);
+  }
+
   function executeSelectedMove(){
     if(resetInProgress){
       setStatus("Reset en cours, mouvement manuel temporairement bloqué.", false);
@@ -1412,12 +1506,7 @@ const pid = boardState[key];
     } else if (t === "N") {
       const path = findShortestPath(boardState, from, to);
       if(!path || path.length < 2){
-        // Check for capture BEFORE applying move
-        const destPid = getPieceAt(boardState, to.f, to.r);
-        if(destPid){
-          const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
-          addToCapturedZone(destPid, destSide);
-        }
+        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
         send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
         boardState = res.nextBoard;
         if(res.rightsUpdate){
@@ -1446,12 +1535,7 @@ const pid = boardState[key];
         return;
       }
       if(path.length > MAX_WP){
-        // Check for capture BEFORE applying move
-        const destPid = getPieceAt(boardState, to.f, to.r);
-        if(destPid){
-          const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
-          addToCapturedZone(destPid, destSide);
-        }
+        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
         send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
         boardState = res.nextBoard;
         if(res.rightsUpdate){
@@ -1483,12 +1567,7 @@ const pid = boardState[key];
     } else if (isSlidingPiece(pid)) {
       const clear = isPathClear(boardState, from, to, pid);
       if (clear) {
-        // Check for capture BEFORE applying move
-        const destPid = getPieceAt(boardState, to.f, to.r);
-        if(destPid){
-          const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
-          addToCapturedZone(destPid, destSide);
-        }
+        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
         send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
       } else {
         const path = findShortestPath(boardState, from, to);
@@ -1500,20 +1579,16 @@ const pid = boardState[key];
           setStatus("Chemin trop long pour le déplacement physique.", false);
           return;
         }
-        // Check for capture BEFORE applying move
-        const destPidPath = getPieceAt(boardState, to.f, to.r);
-        if(destPidPath){
-          const destSide = pieceColor(destPidPath) === 'w' ? 'L' : 'R';
-          addToCapturedZone(destPidPath, destSide);
-        }
+        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
         send({cmd:"pathMove", path});
       }
     } else {
-      // Check for capture BEFORE applying move
-      const destPid = getPieceAt(boardState, to.f, to.r);
-      if(destPid){
-        const destSide = pieceColor(destPid) === 'w' ? 'L' : 'R';
-        addToCapturedZone(destPid, destSide);
+      // En passant: captured pawn is at epCaptureSq, not at `to`
+      if (res.epCaptureSq) {
+        const epSq = sqToXY(res.epCaptureSq);
+        sendCaptureToDeadZone(getPieceAt(boardState, epSq.f, epSq.r), epSq.f, epSq.r);
+      } else {
+        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
       }
       send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
     }
@@ -1553,10 +1628,19 @@ const pid = boardState[key];
   });
 
   function connect(){
-    ws = new WebSocket(wsUrl);
-    ws.onopen = () => setStatus("Connecté ✅");
-    ws.onclose = () => { setStatus("Déconnecté… reconnexion", false); setTimeout(connect, 800); };
-    ws.onerror = () => setStatus("Erreur WebSocket", false);
+    console.log("[SC] connect() called, url =", wsUrl);
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch(e) {
+      console.error("[SC] new WebSocket threw:", e);
+      setStatus("Erreur WS: " + e.message, false);
+      setTimeout(connect, 3000);
+      return;
+    }
+    console.log("[SC] WebSocket object created, readyState =", ws.readyState);
+    ws.onopen = () => { console.log("[SC] ws.onopen"); setStatus("Connecté ✅"); };
+    ws.onclose = (ev) => { console.log("[SC] ws.onclose code=", ev.code, "reason=", ev.reason); setStatus("Déconnecté… reconnexion", false); setTimeout(connect, 800); };
+    ws.onerror = (ev) => { console.error("[SC] ws.onerror", ev); setStatus("Erreur WebSocket", false); };
 
     ws.onmessage = (ev) => {
       try {
@@ -1621,6 +1705,9 @@ const pid = boardState[key];
             typeof d.trTotal === "number" ? d.trTotal : 0
           );
         }
+        if (typeof d.wifiSTA !== "undefined" && window._updateWifiPanel) {
+          window._updateWifiPanel(!!d.wifiSTA, d.wifiSSID || "", d.wifiIP || "");
+        }
         runPhysicalResetPump();
       } catch(e) {}
     };
@@ -1638,10 +1725,20 @@ const pid = boardState[key];
   document.getElementById("stop").addEventListener("click", ()=>stopHold());
   document.getElementById("center").addEventListener("click", ()=>{ stopHold(); send({cmd:"move", dir:"center"}); });
 
+
   calibBtn.addEventListener("click", ()=>{
     stopHold();
     send({cmd:"calibAll"});
   });
+
+  [
+    ["calibCornerBottom", ()=>{ stopHold(); send({cmd:"calibCorner", which:"bottom"}); setStatus("Calibration coin bas demandée", true); }],
+    ["calibCornerTop",    ()=>{ stopHold(); send({cmd:"calibCorner", which:"top"});    setStatus("Calibration coin haut demandée", true); }],
+    ["calibDeadZoneL_Bas",  ()=>{ showCalibMovePanel(true, "deadZoneL_Bas");  hideDeadZonePanel(); }],
+    ["calibDeadZoneL_Haut", ()=>{ showCalibMovePanel(true, "deadZoneL_Haut"); hideDeadZonePanel(); }],
+    ["calibDeadZoneR_Bas",  ()=>{ showCalibMovePanel(true, "deadZoneR_Bas");  hideDeadZonePanel(); }],
+    ["calibDeadZoneR_Haut", ()=>{ showCalibMovePanel(true, "deadZoneR_Haut"); hideDeadZonePanel(); }],
+  ].forEach(([id, fn]) => { const el = document.getElementById(id); if(el) el.addEventListener("click", fn); });
 
   tuneBtn.addEventListener("click", ()=>{
     stopHold();
@@ -1699,7 +1796,194 @@ const pid = boardState[key];
   updateTurnOverlay();
   renderBoard();
 
-  document.getElementById("wifiSaveBtn").addEventListener("click", () => {
+  // Calibration avancée — panneau UX guidée (optional elements; wrapped to avoid blocking connect)
+  try {
+  function showCalibMovePanel(show, step=null) {
+    console.log("[calib] showCalibMovePanel show=" + show + " step=" + step);
+    document.getElementById("calibMovePanel").style.display = show ? "flex" : "none";
+    calibCornerMode = show;
+    selectedCalibCorner = null;
+    calibCornerDirty = false;
+    calibStep = show ? step : null;
+
+    // Dead zone endpoints: move carriage to the stored position and start dirty
+    // immediately (the user always needs to confirm or adjust before saving).
+    const dzGoto = {
+      deadZoneL_Bas:  {side:"L", slot:15},
+      deadZoneL_Haut: {side:"L", slot:0},
+      deadZoneR_Bas:  {side:"R", slot:15},
+      deadZoneR_Haut: {side:"R", slot:0},
+    };
+    if (show && step && dzGoto[step]) {
+      const dz = dzGoto[step];
+      console.log("[calib] dead zone selected — sending gotoDeadZone side=" + dz.side + " slot=" + dz.slot);
+      send({cmd:"gotoDeadZone", side:dz.side, slot:dz.slot});
+    } else if (!show && calibStep && dzGoto[calibStep]) {
+      // Panel closing while a dead-zone step was active — restore normal Y limits
+      console.log("[calib] dead zone panel closed without validate — sending endDZCalib");
+      send({cmd:"endDZCalib"});
+    }
+    setCalibDirty(false);
+
+    updateCalibStepUI();
+    renderBoard();
+  }
+  function updateCalibStepUI() {
+    console.log("[calib] updateCalibStepUI — step=" + calibStep + " dirty=" + calibCornerDirty + " corner=" + (selectedCalibCorner ? selectedCalibCorner.which : "none"));
+    const title    = document.getElementById("calibStepTitle");
+    const msg      = document.getElementById("calibStepMsg");
+    const validate = document.getElementById("calibValidate");
+    const feedback = document.getElementById("calibStepFeedback");
+    if(!title || !msg || !validate) return;
+
+    const cornerLabels = {a1:"A1 (bas-gauche)", h1:"H1 (bas-droite)", a8:"A8 (haut-gauche)", h8:"H8 (haut-droite)"};
+    const dzLabels = {
+      deadZoneL_Bas:  "Zone morte G — bas (slot 15, blancs)",
+      deadZoneL_Haut: "Zone morte G — haut (slot 0, blancs)",
+      deadZoneR_Bas:  "Zone morte D — bas (slot 15, noirs)",
+      deadZoneR_Haut: "Zone morte D — haut (slot 0, noirs)",
+    };
+
+    if(!calibStep || calibStep === "advanced") {
+      // Initial state — waiting for user to pick a corner or a dead-zone endpoint
+      title.textContent    = "Calibration avancée";
+      msg.textContent      = calibCornerMode
+        ? "Clique sur l'un des 4 coins du board, ou sélectionne un endpoint de zone morte ci-dessus."
+        : "Sélectionne un point à calibrer.";
+      validate.textContent = "Valider cette position";
+      validate.disabled    = true;
+      console.log("[calib] updateCalibStepUI → disabled (no step / advanced)");
+    } else if(cornerLabels[calibStep]) {
+      title.textContent    = "Coin " + cornerLabels[calibStep];
+      msg.textContent      = "Fine-tune avec les flèches, puis valide quand le chariot est exactement sur le coin.";
+      validate.textContent = "Valider coin " + calibStep.toUpperCase();
+      validate.disabled    = false;
+      console.log("[calib] updateCalibStepUI → enabled for corner " + calibStep);
+    } else if(dzLabels[calibStep]) {
+      title.textContent    = dzLabels[calibStep];
+      msg.textContent      = "Positionne le chariot à l'emplacement de ce slot, puis valide.";
+      validate.textContent = "Valider cette position";
+      validate.disabled    = false;
+      console.log("[calib] updateCalibStepUI → enabled for dead zone " + calibStep);
+    } else {
+      // Unknown step — disable to avoid silent no-ops
+      validate.textContent = "Valider cette position";
+      validate.disabled    = true;
+      console.log("[calib] updateCalibStepUI → disabled (unknown step: " + calibStep + ")");
+    }
+    if(feedback) feedback.textContent = "";
+  }
+  document.getElementById("calibValidate").addEventListener("click", ()=>{
+    console.log("[calib] validate clicked — step=" + calibStep + " dirty=" + calibCornerDirty + " corner=" + (selectedCalibCorner ? selectedCalibCorner.which : "none"));
+    const fb = document.getElementById("calibStepFeedback");
+    if (calibStep === "a1" || calibStep === "h1" || calibStep === "a8" || calibStep === "h8") {
+      console.log("[calib] sending calibCorner which=" + calibStep);
+      send({cmd:"calibCorner", which: calibStep});
+      // Flash validate button green then reset
+      const savedStep = calibStep;
+      selectedCalibCorner = null;
+      calibStep = null;
+      calibCornerDirty = false;
+      const btn = document.getElementById("calibValidate");
+      if(btn){
+        btn.classList.remove("calib-dirty");
+        btn.classList.add("calib-ok");
+        btn.textContent = "✅ Coin " + savedStep.toUpperCase() + " enregistré";
+        setTimeout(()=>{
+          btn.classList.remove("calib-ok");
+          updateCalibStepUI();
+        }, 1800);
+      }
+      if(fb) fb.textContent = "";
+      renderBoard();
+      return;
+    } else if (calibStep === "cornerBottom") {
+      send({cmd:"calibCorner", which:"bottom"});
+      if(fb) fb.textContent = "Coin bas enregistré !";
+    } else if (calibStep === "cornerTop") {
+      send({cmd:"calibCorner", which:"top"});
+      if(fb) fb.textContent = "Coin haut enregistré !";
+    } else if (calibStep === "deadZoneL_Bas" || calibStep === "deadZoneL_Haut"
+            || calibStep === "deadZoneR_Bas" || calibStep === "deadZoneR_Haut") {
+      const dzMap = {
+        deadZoneL_Bas:  {side:"L", ext:"bas",  label:"Zone G bas"},
+        deadZoneL_Haut: {side:"L", ext:"haut", label:"Zone G haut"},
+        deadZoneR_Bas:  {side:"R", ext:"bas",  label:"Zone D bas"},
+        deadZoneR_Haut: {side:"R", ext:"haut", label:"Zone D haut"},
+      };
+      const dz = dzMap[calibStep];
+      send({cmd:"calibDeadZone", side:dz.side, ext:dz.ext});
+      calibCornerDirty = false;
+      const btn = document.getElementById("calibValidate");
+      if(btn){
+        btn.classList.remove("calib-dirty");
+        btn.classList.add("calib-ok");
+        btn.textContent = "✅ " + dz.label + " enregistré";
+        setTimeout(()=>{
+          btn.classList.remove("calib-ok");
+          updateCalibStepUI();
+        }, 1800);
+      }
+      if(fb) fb.textContent = "";
+    }
+  });
+  document.getElementById("calibCancel").addEventListener("click", ()=>{
+    showCalibMovePanel(false);
+  });
+  document.getElementById("calibAdvanced").addEventListener("click", ()=>{
+    showCalibMovePanel(true, "advanced");
+    document.getElementById("deadZoneCalibPanel").style.display = "flex";
+  });
+  function hideDeadZonePanel() {
+    document.getElementById("deadZoneCalibPanel").style.display = "none";
+  }
+  document.getElementById("calibCancel").addEventListener("click", ()=>{ hideDeadZonePanel(); });
+
+  // 4 dead-zone endpoint buttons
+  [
+    ["calibDZL_Bas",  "deadZoneL_Bas"],
+    ["calibDZL_Haut", "deadZoneL_Haut"],
+    ["calibDZR_Bas",  "deadZoneR_Bas"],
+    ["calibDZR_Haut", "deadZoneR_Haut"],
+  ].forEach(([id, step]) => {
+    const el = document.getElementById(id);
+    if(el) el.addEventListener("click", ()=>{ showCalibMovePanel(true, step); hideDeadZonePanel(); });
+  });
+  ["calibBtn","testRunBtn","tuneBtn"].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.addEventListener("click", ()=>showCalibMovePanel(false));
+  });
+  } catch(e) { console.warn("[calib bindings]", e); }
+
+  const wifiStatusBadge = document.getElementById("wifiStatusBadge");
+  const wifiForm        = document.getElementById("wifiForm");
+  let wifiSTAKnown = false;
+
+  function updateWifiPanel(sta, ssid, ip) {
+    if (sta) {
+      wifiStatusBadge.innerHTML =
+        '<span style="color:#1dd1a1;font-weight:700;">✅ Connecté à ' + ssid + '</span>' +
+        ' &mdash; <span style="opacity:.7;">' + ip + '</span>' +
+        ' &nbsp;<button class="mini" id="wifiChangeBtn" style="font-size:11px;padding:4px 10px;">Modifier</button>';
+      if (!wifiSTAKnown) wifiForm.style.display = "none";
+      const chg = document.getElementById("wifiChangeBtn");
+      if (chg) chg.addEventListener("click", () => {
+        wifiForm.style.display = wifiForm.style.display === "none" ? "flex" : "none";
+      });
+    } else {
+      wifiStatusBadge.innerHTML =
+        '<span style="color:#f9ca24;font-weight:700;">📡 Mode AP — non connecté à un réseau</span>' +
+        '<div style="font-size:12px;opacity:.65;margin-top:4px;">Entre tes credentials pour rejoindre ton réseau maison.</div>';
+      wifiForm.style.display = "flex";
+    }
+    wifiSTAKnown = true;
+  }
+
+  // Hook telemetry to update the WiFi panel (called from ws.onmessage handler below via a small bridge)
+  window._updateWifiPanel = updateWifiPanel;
+
+  const wifiSaveBtn = document.getElementById("wifiSaveBtn");
+  if (wifiSaveBtn) wifiSaveBtn.addEventListener("click", () => {
     const ssid = document.getElementById("wifiSsid").value.trim();
     const pass = document.getElementById("wifiPass").value;
     const msg  = document.getElementById("wifiMsg");
@@ -1710,13 +1994,17 @@ const pid = boardState[key];
     send({cmd:"wifiConfig", ssid, pass});
   });
 
-  connect();
 </script>
 </body>
 </html>
 )HTML";
 
-static void handleRoot() { server.send(200, "text/html", PAGE_INDEX); }
+static void handleRoot() {
+  // Cache for 10 minutes so the browser doesn't re-download 80 KB on every reload.
+  // After flashing new firmware, do a hard refresh (Cmd+Shift+R / Ctrl+Shift+R) to bypass.
+  server.sendHeader("Cache-Control", "max-age=600");
+  server.send_P(200, "text/html", PAGE_INDEX);
+}
 
 void webInit() {
   server.on("/", handleRoot);
@@ -1802,7 +2090,28 @@ void webPushTelemetry() {
   busy    = commandsIsBusy();
   pending = commandsPendingCount();
 
-  char msg[800];
+  // WiFi status — cached every 2 s to avoid repeated String heap allocations.
+  static bool   s_wifiSTA  = false;
+  static char   s_wifiSSID[36] = "";
+  static char   s_wifiIP[20]   = "";
+  static unsigned long s_wifiCacheMs = 0;
+  unsigned long nowWifi = millis();
+  if (nowWifi - s_wifiCacheMs >= 2000) {
+    s_wifiCacheMs = nowWifi;
+    s_wifiSTA = (WiFi.status() == WL_CONNECTED);
+    if (s_wifiSTA) {
+      strncpy(s_wifiSSID, WiFi.SSID().c_str(), sizeof(s_wifiSSID) - 1);
+      strncpy(s_wifiIP,   WiFi.localIP().toString().c_str(), sizeof(s_wifiIP) - 1);
+    } else {
+      strncpy(s_wifiSSID, AP_SSID, sizeof(s_wifiSSID) - 1);
+      strncpy(s_wifiIP,   WiFi.softAPIP().toString().c_str(), sizeof(s_wifiIP) - 1);
+    }
+  }
+  bool wifiSTA = s_wifiSTA;
+  const char* wifiSSID = s_wifiSSID;
+  const char* wifiIP   = s_wifiIP;
+
+  char msg[900];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
            "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,"
@@ -1810,7 +2119,8 @@ void webPushTelemetry() {
            "\"sysState\":%u,\"tuning\":%s,\"tunePhase\":%u,\"tunePct\":%d,"
            "\"liveTuneSpd\":%.0f,\"liveTuneSpdDiag\":%.0f,\"liveTuneAcc\":%.0f,\"liveTuneDecel\":%.0f,\"liveTuneCurr\":%u,"
            "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u,"
-           "\"testRun\":%s,\"trStep\":\"%s\",\"trIdx\":%u,\"trTotal\":%u}",
+           "\"testRun\":%s,\"trStep\":\"%s\",\"trIdx\":%u,\"trTotal\":%u,"
+           "\"wifiSTA\":%s,\"wifiSSID\":\"%s\",\"wifiIP\":\"%s\"}",
            pct, v, i, xDisp, yDisp, (unsigned)sp,
            (magOn     ? "true" : "false"),
            (hallY     ? "true" : "false"),
@@ -1829,7 +2139,10 @@ void webPushTelemetry() {
            (testRunActive ? "true" : "false"),
            trStepSnap,
            (unsigned)trIdxSnap,
-           (unsigned)trTotalSnap);
+           (unsigned)trTotalSnap,
+           (wifiSTA   ? "true" : "false"),
+           wifiSSID,
+           wifiIP);
 
   webSocket.broadcastTXT(msg);
 }

@@ -41,6 +41,7 @@ void startWiFi() {
 
   if (strlen(useSsid) > 0) {
     WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_13dBm);   // reduce peak current on battery (~150 mA vs ~240 mA)
     WiFi.begin(useSsid, usePass);
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(250);
@@ -48,6 +49,7 @@ void startWiFi() {
     Serial.println("[WIFI] STA connection failed — falling back to AP mode");
   }
   WiFi.mode(WIFI_AP);
+  WiFi.setTxPower(WIFI_POWER_13dBm);     // reduce peak current on battery
   WiFi.softAP(AP_SSID, AP_PASS);
   delay(200);
 }

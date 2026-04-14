@@ -1,3 +1,5 @@
+
+
 #include "Commands.h"
 #include "Utils.h"
 #include "Magnet.h"
@@ -8,7 +10,6 @@
 #include "AutoTune.h"
 #include "ChessTestRun.h"
 #include "WiFiNet.h"
-#include "WebUI.h"
 
 enum PendingMoveType : uint8_t {
   PM_SQUARE = 0,
@@ -147,10 +148,12 @@ void setDirCommand(const String& dir) {
 
 void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   (void)num;
-  // Push state immediately when a new client connects so the UI populates
-  // instantly instead of waiting for the next scheduled 100ms push.
+  // Request an immediate telemetry push for the new client.
+  // Done via a flag rather than calling webPushTelemetry() directly here,
+  // because we're inside webSocket.loop() — re-entering broadcastTXT()
+  // from within the event callback corrupts the library's internal state.
   if (type == WStype_CONNECTED) {
-    webPushTelemetry();
+    g_wsPushPending = true;
     return;
   }
   if (type != WStype_TEXT) return;
@@ -199,6 +202,154 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
       return;
     }
     startFullCalibration();
+    return;
+  }
+
+  // { "cmd": "calibCorner", "which": "a1"|"h1"|"a8"|"h8" }
+  // The carriage is currently positioned at the centre of the named corner square.
+  // Back-calculate the board origin so the whole grid is updated.
+  if (strcmp(cmd, "calibCorner") == 0) {
+    const char* which = doc["which"];
+    if (!which) return;
+
+    long xNow, yNow;
+    portENTER_CRITICAL(&gMux);
+    xNow = g_xAbs;
+    yNow = g_yAbs;
+    portEXIT_CRITICAL(&gMux);
+
+    // Store the calibrated centre directly into the corner's own global —
+    // the other 3 corners are NOT touched.  boardUpdateFromCorners() then
+    // recomputes the bilinear boundary so every square reinterpolates correctly.
+    portENTER_CRITICAL(&gMux);
+    if      (strcmp(which, "a1") == 0) { g_A1C_X = xNow; g_A1C_Y = yNow; }
+    else if (strcmp(which, "h1") == 0) { g_H1C_X = xNow; g_H1C_Y = yNow; }
+    else if (strcmp(which, "a8") == 0) { g_A8C_X = xNow; g_A8C_Y = yNow; }
+    else if (strcmp(which, "h8") == 0) { g_H8C_X = xNow; g_H8C_Y = yNow; }
+    else { portEXIT_CRITICAL(&gMux); Serial.printf("[CALIB] calibCorner unknown which=%s\n", which); return; }
+    portEXIT_CRITICAL(&gMux);
+
+    boardUpdateFromCorners();
+    g_calibNvsDirty   = true;
+    g_calibNvsDirtyMs = millis();
+    Serial.printf("[CALIB] corner %s set to abs=(%ld,%ld) — all squares reinterpolated\n", which, xNow, yNow);
+    return;
+  }
+
+  // { "cmd": "calibDeadZone", "side": "L"|"R", "ext": "bas"|"haut" }
+  // Carriage is at the desired position for this dead-zone endpoint.
+  if (strcmp(cmd, "calibDeadZone") == 0) {
+    const char* side = doc["side"];
+    const char* ext  = doc["ext"];
+    if (!side || !ext) return;
+
+    long xNow, yNow;
+    portENTER_CRITICAL(&gMux);
+    xNow = g_xAbs;
+    yNow = g_yAbs;
+    portEXIT_CRITICAL(&gMux);
+
+    portENTER_CRITICAL(&gMux);
+    if (strcmp(side, "L") == 0) {
+      if (strcmp(ext, "bas")  == 0) { g_DZ_L_Bas_X  = xNow; g_DZ_L_Bas_Y  = yNow; }
+      else                          { g_DZ_L_Haut_X = xNow; g_DZ_L_Haut_Y = yNow; g_DZ_L_Calibrated = true; }
+    } else {
+      if (strcmp(ext, "bas")  == 0) { g_DZ_R_Bas_X  = xNow; g_DZ_R_Bas_Y  = yNow; }
+      else                          { g_DZ_R_Haut_X = xNow; g_DZ_R_Haut_Y = yNow; g_DZ_R_Calibrated = true; }
+    }
+    g_dzCalibYExpanded = false;  // calibration validated — restore normal Y limits
+    portEXIT_CRITICAL(&gMux);
+    g_calibNvsDirty   = true;
+    g_calibNvsDirtyMs = millis();
+    Serial.printf("[DZ] calibDeadZone side=%s ext=%s pos=(%ld,%ld)\n", side, ext, xNow, yNow);
+    return;
+  }
+
+  // { "cmd": "deadZoneMove", "ff": file, "fr": rank, "side": "L"|"R", "slot": 0..15 }
+  // Pick up the piece at (ff,fr) and deliver it to the physical dead-zone slot.
+  if (strcmp(cmd, "deadZoneMove") == 0) {
+    if (!doc.containsKey("ff") || !doc.containsKey("fr") ||
+        !doc.containsKey("side") || !doc.containsKey("slot")) return;
+    int ff   = (int)doc["ff"];
+    int fr   = (int)doc["fr"];
+    int slot = (int)doc["slot"];
+    const char* side = doc["side"];
+    if (ff < 0 || ff > 7 || fr < 1 || fr > 8) return;
+    if (slot < 0 || slot > 15 || !side) return;
+
+    long srcX, srcY;
+    squareCenterSteps((uint8_t)ff, (uint8_t)fr, srcX, srcY);
+
+    long dzX, dzY;
+    deadZoneSlotPos(side[0], (uint8_t)slot, dzX, dzY);
+
+    portENTER_CRITICAL(&gMux);
+    g_dzPathYExpanded = true;  // expand Y limits for the duration of this path
+    portEXIT_CRITICAL(&gMux);
+
+    PendingMove m = {};
+    m.type   = PM_PATH;
+    m.wps[0] = { srcX, srcY, 1 };  // arrive at piece → magnet ON
+    m.wps[1] = { dzX,  dzY,  0 };  // arrive at slot  → magnet OFF
+    m.n      = 2;
+    enqueueOrExecute(m);
+    Serial.printf("[DZ] deadZoneMove (%d,%d) -> side=%s slot=%d abs=(%ld,%ld)\n",
+                  ff, fr, side, slot, dzX, dzY);
+    return;
+  }
+
+  // { "cmd": "gotoSquare", "f": 0..7, "r": 1..8 }
+  // Move carriage to the centre of the given square unconditionally (no same-square skip).
+  // Used by calibration UI to position the carriage on a corner.
+  if (strcmp(cmd, "gotoSquare") == 0) {
+    if (!doc.containsKey("f") || !doc.containsKey("r")) return;
+    int f = (int)doc["f"];
+    int r = (int)doc["r"];
+    if (f < 0 || f > 7 || r < 1 || r > 8) return;
+
+    long tx, ty;
+    squareCenterSteps((uint8_t)f, (uint8_t)r, tx, ty);
+
+    PendingMove m = {};
+    m.type   = PM_PATH;
+    m.wps[0] = { tx, ty, -1 };
+    m.n      = 1;
+    enqueueOrExecute(m);
+    Serial.printf("[CALIB] gotoSquare f=%d r=%d abs=(%ld,%ld)\n", f, r, tx, ty);
+    return;
+  }
+
+  // { "cmd": "gotoDeadZone", "side": "L"|"R", "slot": 0..15 }
+  // Move carriage to the stored (or fallback) dead-zone position for that endpoint.
+  // Used by calibration UI to show the user where the current position is.
+  if (strcmp(cmd, "gotoDeadZone") == 0) {
+    const char* side = doc["side"];
+    if (!side || !doc.containsKey("slot")) return;
+    uint8_t slot = (uint8_t)(int)doc["slot"];
+    long tx, ty;
+    deadZoneSlotPos(side[0], slot, tx, ty);
+
+    portENTER_CRITICAL(&gMux);
+    g_dzCalibYExpanded = true;  // keep Y limits expanded while calib panel is open
+    portEXIT_CRITICAL(&gMux);
+
+    PendingMove m = {};
+    m.type   = PM_PATH;
+    m.wps[0] = { tx, ty, -1 };
+    m.n      = 1;
+    enqueueOrExecute(m);
+    Serial.printf("[DZ] gotoDeadZone side=%s slot=%d abs=(%ld,%ld)\n", side, slot, tx, ty);
+    return;
+  }
+
+  // { "cmd": "endDZCalib" }
+  // Sent by the UI when the dead-zone calibration panel is closed without validating
+  // (cancel or switching away). Restores normal Y limits.
+  if (strcmp(cmd, "endDZCalib") == 0) {
+    portENTER_CRITICAL(&gMux);
+    g_dzCalibYExpanded = false;
+    portEXIT_CRITICAL(&gMux);
+    Serial.println("[DZ] endDZCalib — Y limits restored");
     return;
   }
 

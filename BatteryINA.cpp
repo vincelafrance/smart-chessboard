@@ -6,7 +6,7 @@ static float vbuf[AVG_SAMPLES];
 static int   vindex = 0;
 static bool  vfilled = false;
 
-static float lastStablePercent = 0.0f;
+static float lastStablePercent = -1.0f;  // -1 = no stable reading yet
 static unsigned long restStartMs = 0;
 
 static float movingAverageVoltage(float v) {
@@ -62,5 +62,6 @@ void readBatteryOnce(float &v_bus, float &i_A, float &pct_stable) {
   } else {
     restStartMs = 0;
   }
-  pct_stable = lastStablePercent;
+  // Before the first stable reading, show the live raw percent rather than 0.
+  pct_stable = (lastStablePercent >= 0.0f) ? lastStablePercent : pct_raw;
 }

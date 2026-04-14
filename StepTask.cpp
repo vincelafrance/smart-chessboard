@@ -34,7 +34,8 @@ static void stepTask(void *param) {
       uint32_t du = (uint32_t)(nowUs - prevUs);
       dt = (float)du / 1000000.0f;
       if (dt < 0.00005f) dt = 0.00005f;
-      if (dt > 0.01f)    dt = 0.01f;
+      if (dt > 0.001f)   dt = 0.001f;  // cap at 1 ms — WiFi preemptions on Core 0 can spike dt;
+                                        // capping prevents large one-shot acceleration jumps
     }
     prevUs = nowUs;
 
@@ -256,6 +257,7 @@ static void stepTask(void *param) {
             g_pathActive = false;
             g_wpCount = 0;
             g_wpIndex = 0;
+            g_dzPathYExpanded = false;  // dead-zone path complete — restore normal Y limits
           } else {
             g_wpIndex = idx;
             g_pathTargetX = g_waypoints[idx].x;
@@ -332,6 +334,7 @@ static void stepTask(void *param) {
           g_pathActive = false;
           g_wpCount = 0;
           g_wpIndex = 0;
+          g_dzPathYExpanded = false;  // dead-zone path complete — restore normal Y limits
         } else {
           g_wpIndex = idx;
           g_pathTargetX = g_waypoints[idx].x;
@@ -492,7 +495,12 @@ static void stepTask(void *param) {
     if (dirB != 0) gpio_set_level((gpio_num_t)RIGHT_DIR, (dirB > 0) ? 1 : 0);
 
     if (pA != 0 && (uint32_t)(nowUs - lastA) >= pA) {
-      lastA = nowUs;
+      // Phase-preserving advance: catch up one missed period so WiFi preemptions
+      // don't permanently slow the motor.  If we fell more than 2 periods behind,
+      // snap to now instead — guarantees at most 1 step per loop iteration and
+      // prevents micro-burst noise from rapid catch-up firing.
+      if ((uint32_t)(nowUs - lastA) > 2 * pA) lastA = nowUs;
+      else lastA += pA;
       stepPulseFast((gpio_num_t)LEFT_STEP);
       portENTER_CRITICAL(&gMux);
       g_Apos += (dirA > 0 ? 1 : -1);
@@ -500,7 +508,8 @@ static void stepTask(void *param) {
     }
 
     if (pB != 0 && (uint32_t)(nowUs - lastB) >= pB) {
-      lastB = nowUs;
+      if ((uint32_t)(nowUs - lastB) > 2 * pB) lastB = nowUs;
+      else lastB += pB;
       stepPulseFast((gpio_num_t)RIGHT_STEP);
       portENTER_CRITICAL(&gMux);
       g_Bpos += (dirB > 0 ? 1 : -1);
@@ -513,5 +522,8 @@ static void stepTask(void *param) {
 }
 
 void stepTaskStart() {
+  // Core 0: WiFi stack also runs here (priority 22-23) but the phase-preserving
+  // step timing (lastA += pA) recovers missed steps immediately after preemptions.
+  // loop()/webLoop() run on Core 1 uncontested.
   xTaskCreatePinnedToCore(stepTask, "stepTask", 4096, nullptr, 3, &stepTaskHandle, 0);
 }

@@ -35,6 +35,12 @@ volatile long g_H1C_X = H1C_REF_X, g_H1C_Y = H1C_REF_Y;
 volatile long g_A8C_X = A8C_REF_X, g_A8C_Y = A8C_REF_Y;
 volatile long g_H8C_X = H8C_REF_X, g_H8C_Y = H8C_REF_Y;
 
+// ORIGIN_REF_X/Y = 0, so initial corners are already at OFF_xxx values.
+// Initialise to 0 so the first boardUpdateFromOrigin delta = (newCenter - 0)
+// which correctly shifts corners from their REF positions to the calibrated center.
+volatile long g_lastOrigin_X = ORIGIN_REF_X;
+volatile long g_lastOrigin_Y = ORIGIN_REF_Y;
+
 volatile long g_BO_A1_X = 0, g_BO_A1_Y = 0;
 volatile long g_BO_H1_X = 0, g_BO_H1_Y = 0;
 volatile long g_BO_A8_X = 0, g_BO_A8_Y = 0;
@@ -85,6 +91,22 @@ volatile bool g_autoMagnetPath = false;
 // Auto calib
 volatile bool g_autoCalibRequested = false;
 volatile bool g_autoCalibStarted   = false;
+
+// Dead zone endpoints (0 = not yet calibrated — fallback used)
+volatile long g_DZ_L_Bas_X  = 0, g_DZ_L_Bas_Y  = 0;
+volatile long g_DZ_L_Haut_X = 0, g_DZ_L_Haut_Y = 0;
+volatile long g_DZ_R_Bas_X  = 0, g_DZ_R_Bas_Y  = 0;
+volatile long g_DZ_R_Haut_X = 0, g_DZ_R_Haut_Y = 0;
+volatile bool g_DZ_L_Calibrated = false;
+volatile bool g_DZ_R_Calibrated = false;
+
+volatile bool g_dzCalibYExpanded = false;
+volatile bool g_dzPathYExpanded  = false;
+
+volatile bool g_wsPushPending = false;
+
+volatile bool          g_calibNvsDirty   = false;
+volatile unsigned long g_calibNvsDirtyMs = 0;
 
 // Chess Test Run
 volatile bool    g_testRunActive   = false;

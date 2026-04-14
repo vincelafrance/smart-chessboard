@@ -21,13 +21,16 @@ void markMotion() { g_lastMotionMs = millis(); }
 
 void getYLimits(long &yMin, long &yMax) {
   portENTER_CRITICAL(&gMux);
-  bool cal = g_yLimitsCalibrated;
-  long mn  = g_yHardMin;
-  long mx  = g_yHardMax;
+  bool cal     = g_yLimitsCalibrated;
+  long mn      = g_yHardMin;
+  long mx      = g_yHardMax;
+  bool dzExtra = g_dzCalibYExpanded || g_dzPathYExpanded;
   portEXIT_CRITICAL(&gMux);
 
   if (!cal) { yMin = Y_HARD_MIN_DEFAULT; yMax = Y_HARD_MAX_DEFAULT; }
   else      { yMin = mn;                 yMax = mx; }
+
+  if (dzExtra) { yMin -= DZ_Y_EXTRA; yMax += DZ_Y_EXTRA; }
 }
 
 void getXLimits(long &xMin, long &xMax) {

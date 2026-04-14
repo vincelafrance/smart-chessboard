@@ -108,6 +108,11 @@ extern volatile long g_H1C_X; extern volatile long g_H1C_Y;
 extern volatile long g_A8C_X; extern volatile long g_A8C_Y;
 extern volatile long g_H8C_X; extern volatile long g_H8C_Y;
 
+// Last origin used by boardUpdateFromOrigin — used to compute delta on recalibration
+// so advanced corner fine-tuning is preserved when normal calibration runs again.
+extern volatile long g_lastOrigin_X;
+extern volatile long g_lastOrigin_Y;
+
 extern volatile long g_BO_A1_X; extern volatile long g_BO_A1_Y;
 extern volatile long g_BO_H1_X; extern volatile long g_BO_H1_Y;
 extern volatile long g_BO_A8_X; extern volatile long g_BO_A8_Y;
@@ -260,6 +265,37 @@ extern volatile bool g_autoCalibRequested;
 extern volatile bool g_autoCalibStarted;
 
 // =======================================================
+// Dead zone physical endpoints
+// Left  = whites captured (low X side)
+// Right = blacks captured (high X side)
+// Slot 15 = bas (first piece placed), slot 0 = haut (last)
+// =======================================================
+extern volatile long g_DZ_L_Bas_X,  g_DZ_L_Bas_Y;
+extern volatile long g_DZ_L_Haut_X, g_DZ_L_Haut_Y;
+extern volatile long g_DZ_R_Bas_X,  g_DZ_R_Bas_Y;
+extern volatile long g_DZ_R_Haut_X, g_DZ_R_Haut_Y;
+extern volatile bool g_DZ_L_Calibrated;   // true once both L endpoints saved
+extern volatile bool g_DZ_R_Calibrated;
+
+// Extended Y-axis soft limits (+50 steps each side) active only when:
+//   g_dzCalibYExpanded — dead-zone calibration panel is open (set by gotoDeadZone,
+//                         cleared by calibDeadZone or endDZCalib command)
+//   g_dzPathYExpanded  — a deadZoneMove path is in flight (set by deadZoneMove,
+//                         cleared by StepTask on path completion or abortPath)
+extern volatile bool g_dzCalibYExpanded;
+extern volatile bool g_dzPathYExpanded;
+static const long DZ_Y_EXTRA = 100;
+
+// =======================================================
+// WebSocket deferred push (set by onWsEvent on connect, consumed by loop())
+extern volatile bool g_wsPushPending;
+
+// Deferred NVS calibration save.  Any code that mutates calibration globals
+// sets this flag instead of calling saveCalibToNVS() directly.  loop() performs
+// the actual (slow, blocking) write when the system is otherwise idle.
+extern volatile bool     g_calibNvsDirty;
+extern volatile unsigned long g_calibNvsDirtyMs;  // millis() when flag was last set
+
 // Chess Test Run
 // =======================================================
 extern volatile bool    g_testRunActive;

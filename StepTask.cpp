@@ -1,4 +1,5 @@
 #include "StepTask.h"
+#include "StepGen.h"
 #include "MotionCoreXY.h"
 #include "Utils.h"
 #include "Magnet.h"
@@ -10,9 +11,9 @@ static TaskHandle_t stepTaskHandle = nullptr;
 static void stepTask(void *param) {
   (void)param;
 
-  uint32_t lastA = micros();
-  uint32_t lastB = micros();
-  uint32_t prevUs = lastA;
+  // Fixed 1 ms timestep — step timing is now handled entirely by hardware
+  // timers (StepGen).  The task only computes velocity and acceleration.
+  const float dt = 0.001f;
 
   float vA_cur = 0.0f;
   float vB_cur = 0.0f;
@@ -26,19 +27,11 @@ static void stepTask(void *param) {
   static uint8_t pickupWaitWpIdx = 255;
 
   for (;;) {
-    uint32_t nowUs = micros();
     unsigned long nowMs = millis();
 
-    float dt = 0.001f;
-    if (prevUs != 0) {
-      uint32_t du = (uint32_t)(nowUs - prevUs);
-      dt = (float)du / 1000000.0f;
-      if (dt < 0.00005f) dt = 0.00005f;
-      if (dt > 0.001f)   dt = 0.001f;  // cap at 1 ms — WiFi preemptions on Core 0 can spike dt;
-                                        // capping prevents large one-shot acceleration jumps
-    }
-    prevUs = nowUs;
-
+    // -----------------------------------------------------------------------
+    // Read current motor positions (updated by StepGen ISR).
+    // -----------------------------------------------------------------------
     long Apos, Bpos;
     portENTER_CRITICAL(&gMux);
     Apos = g_Apos;
@@ -48,6 +41,9 @@ static void stepTask(void *param) {
     long xAbsRaw, yAbsRaw;
     getXYfromAB_raw(Apos, Bpos, xAbsRaw, yAbsRaw);
 
+    // -----------------------------------------------------------------------
+    // Snapshot shared state.
+    // -----------------------------------------------------------------------
     CalibState calibState;
     float vx, vy;
     float overrideAccel;
@@ -57,29 +53,31 @@ static void stepTask(void *param) {
     unsigned long lastCmd;
 
     portENTER_CRITICAL(&gMux);
-    calibState = g_calibState;
-    vx = g_vx_xy;
-    vy = g_vy_xy;
+    calibState    = g_calibState;
+    vx            = g_vx_xy;
+    vy            = g_vy_xy;
     overrideAccel = g_overrideAccel;
-    recenter = g_recenter;
-    pathActive = g_pathActive;
-    pathTx = g_pathTargetX;
-    pathTy = g_pathTargetY;
-    lastCmd = g_lastCmdMs;
+    recenter      = g_recenter;
+    pathActive    = g_pathActive;
+    pathTx        = g_pathTargetX;
+    pathTy        = g_pathTargetY;
+    lastCmd       = g_lastCmdMs;
     portEXIT_CRITICAL(&gMux);
 
     const bool calibY = (calibState == CALIB_Y_BOTTOM || calibState == CALIB_Y_TOP);
     const bool calibX = (calibState == CALIB_X_BOTTOM || calibState == CALIB_X_TOP);
 
-    // When calibration hands off to recenter, discard any residual motor
-    // velocity from the previous seek phase so the carriage starts the
-    // Y-then-X recenter cleanly instead of briefly blending into a diagonal.
+    // When calibration hands off to recenter, discard residual motor velocity
+    // so the recenter starts cleanly instead of blending with the seek phase.
     if (recenter && !prevRecenter && (prevCalibY || prevCalibX)) {
       vA_cur = 0.0f;
       vB_cur = 0.0f;
       settleStartMs = 0;
     }
 
+    // -----------------------------------------------------------------------
+    // Clamp position to soft limits (calibY/X bypass their own axis).
+    // -----------------------------------------------------------------------
     long xMin, xMax, yMin, yMax;
     getXLimits(xMin, xMax);
     getYLimits(yMin, yMax);
@@ -104,6 +102,9 @@ static void stepTask(void *param) {
     long xAbs = xUseAbs;
     long yAbs = yUseAbs;
 
+    // -----------------------------------------------------------------------
+    // Command timeout — zero joystick velocity when idle.
+    // -----------------------------------------------------------------------
     if (!calibY && !calibX && !recenter && !pathActive && (nowMs - lastCmd > CMD_TIMEOUT_MS)) {
       portENTER_CRITICAL(&gMux);
       g_vx_xy = 0;
@@ -112,6 +113,9 @@ static void stepTask(void *param) {
       vx = 0; vy = 0;
     }
 
+    // -----------------------------------------------------------------------
+    // Compute XY velocity target.
+    // -----------------------------------------------------------------------
     float vx_t = 0.0f, vy_t = 0.0f;
 
     if (calibY) {
@@ -121,18 +125,16 @@ static void stepTask(void *param) {
       settleStartMs = 0;
     }
     else if (calibX) {
-      // Appliquer un taper sur la vitesse minimale et la capabilité près du centre pour éviter les coups.
       long xTarget = (calibState == CALIB_X_TOP) ? xMax : xMin;
       long ex = xTarget - xAbs;
       long exAbs = labs(ex);
       float dirX = (calibState == CALIB_X_TOP) ? -(float)CALIB_X_DIR : (float)CALIB_X_DIR;
-      float vCapX = fmaxf(180.0f, CALIB_X_SPEED * 1.0f); // vCapX = CALIB_X_SPEED, mais on garde la structure pour le taper
-      float minVX = CALIB_X_SPEED * 0.5f; // minVX = 50% de la vitesse de calibration
+      float vCapX = fmaxf(180.0f, CALIB_X_SPEED * 1.0f);
+      float minVX = CALIB_X_SPEED * 0.5f;
 
-      // Taper près du centre (même logique que recentrage)
       if (exAbs < 120) {
         float t = clampf((float)exAbs / 120.0f, 0.0f, 1.0f);
-        const float minVXNear = 40.0f; // plus doux que recentrage
+        const float minVXNear = 40.0f;
         minVX = minVXNear + (minVX - minVXNear) * t;
         vCapX = fmaxf(100.0f, vCapX * (0.45f + 0.55f * t));
       }
@@ -148,11 +150,8 @@ static void stepTask(void *param) {
       long ex = pathTx - xAbs;
       long ey = pathTy - yAbs;
 
-      // Pre-compute whether the current waypoint requires a full settle (magnet
-      // action or final destination) vs. a fly-through (intermediate routing
-      // corner with no magnet change, e.g. the turn point of a knight L-move).
-      // Done here — before the deadband/speed-cap logic — so fly-through
-      // waypoints can use a wider deadband and skip the near-target decel.
+      // Determine whether the current waypoint needs a full settle (magnet
+      // action or final destination) or is a fly-through corner.
       bool wpNeedsSettle;
       {
         uint8_t wpIdx2 = 0, wpCnt2 = 0;
@@ -176,31 +175,26 @@ static void stepTask(void *param) {
       // AutoTune may inject a speed override; 0 means use firmware default.
       float pathVmax = (g_overrideVmax > 0.0f) ? g_overrideVmax : PATH_VMAX_XY;
 
-      // Blend between axis speed and diagonal speed based on movement direction.
-      // In CoreXY a 45° XY diagonal = one motor at √2× carriage speed (other idle).
-      // diagFrac: 0.0 = pure axis (both motors equal), 1.0 = pure 45° diagonal (one motor).
-      // Applies only when both overrides are set to distinct values.
+      // Blend axis / diagonal speed based on movement direction.
       if (g_overrideVmax > 0.0f && g_overrideDiagVmax > 0.0f &&
           g_overrideDiagVmax != g_overrideVmax) {
-          float ex_f = (float)(pathTx - xAbs);
-          float ey_f = (float)(pathTy - yAbs);
-          float eMag = fmaxf(fabsf(ex_f), fabsf(ey_f));
-          if (eMag > 50.0f) {
-              // Motor A speed ∝ |ex+ey|, motor B speed ∝ |ex-ey|
-              float mA = fabsf(ex_f + ey_f);
-              float mB = fabsf(ex_f - ey_f);
-              float hi = fmaxf(mA, mB);
-              float lo = fminf(mA, mB);
-              float sum = hi + lo;
-              float diagFrac = (sum > 0.0f) ? ((hi - lo) / sum) : 0.0f;
-              pathVmax = g_overrideVmax + diagFrac * (g_overrideDiagVmax - g_overrideVmax);
-          }
+        float ex_f = (float)(pathTx - xAbs);
+        float ey_f = (float)(pathTy - yAbs);
+        float eMag = fmaxf(fabsf(ex_f), fabsf(ey_f));
+        if (eMag > 50.0f) {
+          float mA = fabsf(ex_f + ey_f);
+          float mB = fabsf(ex_f - ey_f);
+          float hi  = fmaxf(mA, mB);
+          float lo  = fminf(mA, mB);
+          float sum = hi + lo;
+          float diagFrac = (sum > 0.0f) ? ((hi - lo) / sum) : 0.0f;
+          pathVmax = g_overrideVmax + diagFrac * (g_overrideDiagVmax - g_overrideVmax);
+        }
       }
       float pathMinV = PATH_MIN_VXY;
       float vCap = pathVmax;
 
-      // Fly-through waypoints use a wider deadband so the carriage advances
-      // without decelerating to a near-stop at every intermediate corner.
+      // Fly-through waypoints use a wider deadband.
       const long wpDeadband = wpNeedsSettle ? (long)RECENTER_DEADBAND_XY : 120L;
       const bool xDone = (labs(ex) <= wpDeadband);
       const bool yDone = (labs(ey) <= wpDeadband);
@@ -210,7 +204,7 @@ static void stepTask(void *param) {
         float vy_raw = PATH_KP * (float)ey;
 
         float maxAbs = fmaxf(fabsf(vx_raw), fabsf(vy_raw));
-        float scale = 1.0f;
+        float scale  = 1.0f;
         if (maxAbs > vCap) scale = vCap / maxAbs;
 
         vx_t = vx_raw * scale;
@@ -230,8 +224,8 @@ static void stepTask(void *param) {
 
         portENTER_CRITICAL(&gMux);
         arrivedIdx = g_wpIndex;
-        cnt = g_wpCount;
-        autoMag = g_autoMagnetPath;
+        cnt        = g_wpCount;
+        autoMag    = g_autoMagnetPath;
         if (arrivedIdx < g_wpCount) magAction = g_waypoints[arrivedIdx].mag;
         portEXIT_CRITICAL(&gMux);
 
@@ -242,38 +236,40 @@ static void stepTask(void *param) {
           if (magAction == 1 || magAction == 0) {
             needsSettle = true;
           } else if (magAction == -1 && arrivedIdx == 1) {
-            // Backwards-compat: old path format picks up at waypoint #1.
             needsSettle = true;
           }
         }
 
-        // Intermediate waypoints without actions are passed continuously.
+        // Fly-through: advance waypoint and let the hardware timers keep the
+        // carriage moving at its current rate for the 1 ms until the next
+        // velocity update picks up the new target.
         if (!needsSettle) {
           portENTER_CRITICAL(&gMux);
           uint8_t idx = g_wpIndex;
-          uint8_t c = g_wpCount;
+          uint8_t c   = g_wpCount;
           idx++;
           if (idx >= c) {
             g_pathActive = false;
-            g_wpCount = 0;
-            g_wpIndex = 0;
-            g_dzPathYExpanded = false;  // dead-zone path complete — restore normal Y limits
+            g_wpCount    = 0;
+            g_wpIndex    = 0;
+            g_dzPathYExpanded = false;
           } else {
-            g_wpIndex = idx;
-            g_pathTargetX = g_waypoints[idx].x;
-            g_pathTargetY = g_waypoints[idx].y;
+            g_wpIndex      = idx;
+            g_pathTargetX  = g_waypoints[idx].x;
+            g_pathTargetY  = g_waypoints[idx].y;
           }
           g_lastCmdMs = nowMs;
           portEXIT_CRITICAL(&gMux);
 
           settleStartMs = 0;
+          vTaskDelay(1);
           continue;
         }
 
+        // --- Magnet actions at settle waypoints ---
         bool needPickupDelay = false;
 
         if (autoMag) {
-          // Waypoint-driven magnet control (supports multi-piece sequences, e.g. castling)
           if (magAction == 1) {
             magnetSet(true);
             Serial.println("[MAGNET] AUTO ON at waypoint");
@@ -283,7 +279,6 @@ static void stepTask(void *param) {
             Serial.println("[MAGNET] AUTO OFF at waypoint");
           }
 
-          // Backwards-compat: if mag actions are not used (-1), keep old behavior
           if (magAction == -1) {
             if (arrivedIdx == 1) {
               magnetSet(true);
@@ -298,7 +293,6 @@ static void stepTask(void *param) {
               portEXIT_CRITICAL(&gMux);
             }
           } else {
-            // If we used waypoint actions, only auto-stop at the final waypoint.
             if (isFinalWp) {
               portENTER_CRITICAL(&gMux);
               g_autoMagnetPath = false;
@@ -306,45 +300,46 @@ static void stepTask(void *param) {
             }
           }
 
-          // Hold briefly after a pickup to let the piece fully attach before moving away.
+          // Hold briefly after pickup to let the piece attach before moving.
           if (needPickupDelay) {
             if (!pickupWaitActive || pickupWaitWpIdx != arrivedIdx) {
-              pickupWaitActive = true;
-              pickupWaitWpIdx = arrivedIdx;
-              pickupWaitStartMs = nowMs;
+              pickupWaitActive    = true;
+              pickupWaitWpIdx     = arrivedIdx;
+              pickupWaitStartMs   = nowMs;
             }
             if ((nowMs - pickupWaitStartMs) < PATH_PICKUP_SETTLE_MS) {
-              vx_t = 0.0f;
-              vy_t = 0.0f;
+              // Stop the motors during the settle delay.
+              stepGenSetA(0, +1);
+              stepGenSetB(0, +1);
+              vTaskDelay(1);
               continue;
             }
             pickupWaitActive = false;
-            pickupWaitWpIdx = 255;
+            pickupWaitWpIdx  = 255;
           } else if (pickupWaitActive && pickupWaitWpIdx == arrivedIdx) {
             pickupWaitActive = false;
-            pickupWaitWpIdx = 255;
+            pickupWaitWpIdx  = 255;
           }
         }
 
         portENTER_CRITICAL(&gMux);
         uint8_t idx = g_wpIndex;
-        uint8_t c = g_wpCount;
+        uint8_t c   = g_wpCount;
         idx++;
         if (idx >= c) {
           g_pathActive = false;
-          g_wpCount = 0;
-          g_wpIndex = 0;
-          g_dzPathYExpanded = false;  // dead-zone path complete — restore normal Y limits
+          g_wpCount    = 0;
+          g_wpIndex    = 0;
+          g_dzPathYExpanded = false;
         } else {
-          g_wpIndex = idx;
-          g_pathTargetX = g_waypoints[idx].x;
-          g_pathTargetY = g_waypoints[idx].y;
+          g_wpIndex      = idx;
+          g_pathTargetX  = g_waypoints[idx].x;
+          g_pathTargetY  = g_waypoints[idx].y;
         }
         g_lastCmdMs = nowMs;
         portEXIT_CRITICAL(&gMux);
 
         settleStartMs = 0;
-
         vx_t = 0.0f;
         vy_t = 0.0f;
       }
@@ -359,7 +354,6 @@ static void stepTask(void *param) {
       long ex = xT - xAbs;
       long ey = yT - yAbs;
 
-      // AutoTune may inject a speed override; 0 means use firmware default.
       float activeVmax = (g_overrideVmax > 0.0f) ? g_overrideVmax : RECENTER_VMAX_XY;
       float vCap = activeVmax;
 
@@ -376,17 +370,14 @@ static void stepTask(void *param) {
         long exAbs = labs(ex);
         float vCapX = fmaxf(140.0f, vCap * 0.42f);
         float minVX = 110.0f;
-        float kpX = 1.15f;
+        float kpX   = 1.15f;
 
-        // Soften the Y->X handoff and the final X approach. On CoreXY the X-only
-        // segment asks one motor to reverse while the other keeps moving, which
-        // is where the carriage most easily feels "kicky".
         if (exAbs < 220) {
           float t = clampf((float)exAbs / 220.0f, 0.0f, 1.0f);
           const float minVXNear = 45.0f;
           minVX = minVXNear + (minVX - minVXNear) * t;
           vCapX = fmaxf(90.0f, vCapX * (0.30f + 0.70f * t));
-          kpX = 0.70f + (kpX - 0.70f) * t;
+          kpX   = 0.70f + (kpX - 0.70f) * t;
         }
 
         vx_t = clampf(kpX * (float)ex, -vCapX, +vCapX);
@@ -399,11 +390,10 @@ static void stepTask(void *param) {
         if (nowMs - settleStartMs >= RECENTER_SETTLE_MS) {
           portENTER_CRITICAL(&gMux);
           g_recenter = false;
-          g_vx_xy = 0;
-          g_vy_xy = 0;
+          g_vx_xy    = 0;
+          g_vy_xy    = 0;
           g_lastCmdMs = nowMs;
           portEXIT_CRITICAL(&gMux);
-
           settleStartMs = 0;
         }
         vx_t = 0.0f;
@@ -416,6 +406,9 @@ static void stepTask(void *param) {
       settleStartMs = 0;
     }
 
+    // -----------------------------------------------------------------------
+    // Edge soft limits.
+    // -----------------------------------------------------------------------
     long yMinUse, yMaxUse, xMinUse, xMaxUse;
     if (calibY) { yMinUse = -200000; yMaxUse = +200000; } else { getYLimits(yMinUse, yMaxUse); }
     if (calibX) { xMinUse = -200000; xMaxUse = +200000; } else { getXLimits(xMinUse, xMaxUse); }
@@ -423,29 +416,26 @@ static void stepTask(void *param) {
     vx_t = applyEdgeLimit1D(vx_t, xAbs, xMinUse, xMaxUse);
     vy_t = applyEdgeLimit1D(vy_t, yAbs, yMinUse, yMaxUse);
 
+    // -----------------------------------------------------------------------
+    // CoreXY transform + acceleration ramp.
+    // -----------------------------------------------------------------------
     float vA_t, vB_t;
     xyToAB(vx_t, vy_t, vA_t, vB_t);
 
-
     float rampUpRate = MOTION_RAMP_UP_AB;
     if (overrideAccel > 0.0f) {
-      // AutoTune path/recenter uses overrideAccel; keep launches smoother than
-      // manual motion while still remaining responsive.
       rampUpRate = clampf(overrideAccel * 3.5f, 22000.0f, MOTION_RAMP_UP_AB);
     }
     float rampDownRate = MOTION_RAMP_DOWN_AB;
     if (g_overrideDecel > 0.0f) {
       rampDownRate = clampf(g_overrideDecel * 3.5f, 22000.0f, MOTION_RAMP_DOWN_AB);
     }
-
     float rampStopRate = MOTION_RAMP_STOP_AB;
     if (g_overrideDecel > 0.0f) {
-      // When AutoTune supplies a decel override, apply it to full stops too
-      // instead of letting the dedicated stop ramp hide the tuned behavior.
       rampStopRate = clampf(g_overrideDecel * 3.5f, 22000.0f, MOTION_RAMP_STOP_AB);
     }
 
-    const float accelUp = rampUpRate * dt;
+    const float accelUp   = rampUpRate   * dt;
     const float accelDown = rampDownRate * dt;
     const float accelStop = rampStopRate * dt;
 
@@ -457,6 +447,9 @@ static void stepTask(void *param) {
     vA_cur = approachf(vA_cur, vA_t, maxDeltaA);
     vB_cur = approachf(vB_cur, vB_t, maxDeltaB);
 
+    // -----------------------------------------------------------------------
+    // Convert velocity to step period and direction.
+    // -----------------------------------------------------------------------
     uint8_t ms = getDriversUARTMicrosteps();
     if (ms == 0) ms = 8;
     const float motorScale = (float)ms / 8.0f;
@@ -467,7 +460,10 @@ static void stepTask(void *param) {
     int8_t dirA = (vA_cur > 1.0f) ? +1 : (vA_cur < -1.0f) ? -1 : 0;
     int8_t dirB = (vB_cur > 1.0f) ? +1 : (vB_cur < -1.0f) ? -1 : 0;
 
-    bool wantsMove = (pA != 0 || pB != 0) || recenter || calibY || calibX || pathActive;
+    // -----------------------------------------------------------------------
+    // Driver management.
+    // -----------------------------------------------------------------------
+    bool wantsMove    = (pA != 0 || pB != 0) || recenter || calibY || calibX || pathActive;
     bool precisionMode = recenter || calibY || calibX || pathActive;
 
     serviceDriversUART(vA_cur, vB_cur, wantsMove, precisionMode);
@@ -479,8 +475,8 @@ static void stepTask(void *param) {
       portEXIT_CRITICAL(&gMux);
     }
 
-    prevCalibY = calibY;
-    prevCalibX = calibX;
+    prevCalibY   = calibY;
+    prevCalibX   = calibX;
     prevRecenter = recenter;
 
     if (DRIVERS_AUTO_DISABLE && !wantsMove) {
@@ -491,39 +487,21 @@ static void stepTask(void *param) {
       if (g_driversEnabled && (nowMs - lastMot >= IDLE_DISABLE_MS)) driversOff();
     }
 
-    if (dirA != 0) gpio_set_level((gpio_num_t)LEFT_DIR,  (dirA > 0) ? 1 : 0);
-    if (dirB != 0) gpio_set_level((gpio_num_t)RIGHT_DIR, (dirB > 0) ? 1 : 0);
+    // -----------------------------------------------------------------------
+    // Hand off to hardware step generator.
+    // The ISR fires the actual GPIO pulses at hardware-timer precision,
+    // completely independent of FreeRTOS scheduling or WiFi activity.
+    // dir is +1 when dirX==0 (period=0 means stopped, dir is irrelevant).
+    // -----------------------------------------------------------------------
+    stepGenSetA(dirA != 0 ? pA : 0, dirA > 0 ? +1 : -1);
+    stepGenSetB(dirB != 0 ? pB : 0, dirB > 0 ? +1 : -1);
 
-    if (pA != 0 && (uint32_t)(nowUs - lastA) >= pA) {
-      // Phase-preserving advance: catch up one missed period so WiFi preemptions
-      // don't permanently slow the motor.  If we fell more than 2 periods behind,
-      // snap to now instead — guarantees at most 1 step per loop iteration and
-      // prevents micro-burst noise from rapid catch-up firing.
-      if ((uint32_t)(nowUs - lastA) > 2 * pA) lastA = nowUs;
-      else lastA += pA;
-      stepPulseFast((gpio_num_t)LEFT_STEP);
-      portENTER_CRITICAL(&gMux);
-      g_Apos += (dirA > 0 ? 1 : -1);
-      portEXIT_CRITICAL(&gMux);
-    }
-
-    if (pB != 0 && (uint32_t)(nowUs - lastB) >= pB) {
-      if ((uint32_t)(nowUs - lastB) > 2 * pB) lastB = nowUs;
-      else lastB += pB;
-      stepPulseFast((gpio_num_t)RIGHT_STEP);
-      portENTER_CRITICAL(&gMux);
-      g_Bpos += (dirB > 0 ? 1 : -1);
-      portEXIT_CRITICAL(&gMux);
-    }
-
-    if (!wantsMove) vTaskDelay(1);
-    else taskYIELD();
+    // Sleep 1 ms — gives loop()/webLoop() CPU time and keeps dt constant.
+    vTaskDelay(1);
   }
 }
 
 void stepTaskStart() {
-  // Core 0: WiFi stack also runs here (priority 22-23) but the phase-preserving
-  // step timing (lastA += pA) recovers missed steps immediately after preemptions.
-  // loop()/webLoop() run on Core 1 uncontested.
+  stepGenInit();
   xTaskCreatePinnedToCore(stepTask, "stepTask", 4096, nullptr, 3, &stepTaskHandle, 0);
 }

@@ -265,8 +265,10 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     return;
   }
 
-  // { "cmd": "deadZoneMove", "ff": file, "fr": rank, "side": "L"|"R", "slot": 0..15 }
-  // Pick up the piece at (ff,fr) and deliver it to the physical dead-zone slot.
+  // { "cmd": "deadZoneMove", "ff": file, "fr": rank, "side": "L"|"R", "slot": 0..15,
+  //   "path": [{f,r},...] (optional BFS waypoints from source to board edge) }
+  // Pick up the piece at (ff,fr), navigate via BFS path if provided to avoid
+  // collisions, then deliver to the physical dead-zone slot.
   if (strcmp(cmd, "deadZoneMove") == 0) {
     if (!doc.containsKey("ff") || !doc.containsKey("fr") ||
         !doc.containsKey("side") || !doc.containsKey("slot")) return;
@@ -288,13 +290,44 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     portEXIT_CRITICAL(&gMux);
 
     PendingMove m = {};
-    m.type   = PM_PATH;
-    m.wps[0] = { srcX, srcY, 1 };  // arrive at piece → magnet ON
-    m.wps[1] = { dzX,  dzY,  0 };  // arrive at slot  → magnet OFF
-    m.n      = 2;
+    m.type = PM_PATH;
+    uint8_t n = 0;
+
+    // If the UI provided a BFS board path, follow it to avoid piece collisions.
+    if (doc.containsKey("path")) {
+      JsonArray pathArr = doc["path"].as<JsonArray>();
+      if (!pathArr.isNull() && pathArr.size() >= 1) {
+        for (JsonVariant v : pathArr) {
+          if (n >= MAX_WAYPOINTS - 1) break;  // reserve one slot for dead-zone
+          if (!v.is<JsonObject>()) continue;
+          JsonObject obj = v.as<JsonObject>();
+          if (!obj.containsKey("f") || !obj.containsKey("r")) continue;
+          int pf = (int)obj["f"];
+          int pr = (int)obj["r"];
+          if (pf < 0 || pf > 7 || pr < 1 || pr > 8) continue;
+          long wx, wy;
+          squareCenterSteps((uint8_t)pf, (uint8_t)pr, wx, wy);
+          m.wps[n++] = { wx, wy, -1 };
+        }
+      }
+    }
+
+    // If no path waypoints were added, fall back to a direct source → dead-zone move.
+    if (n == 0) {
+      m.wps[n++] = { srcX, srcY, -1 };
+    }
+
+    // Dead zone is the final destination.
+    m.wps[n++] = { dzX, dzY, -1 };
+    m.n = n;
+
+    // First waypoint = pick up piece; last waypoint = drop at dead zone.
+    m.wps[0].mag = 1;
+    m.wps[n - 1].mag = 0;
+
     enqueueOrExecute(m);
-    Serial.printf("[DZ] deadZoneMove (%d,%d) -> side=%s slot=%d abs=(%ld,%ld)\n",
-                  ff, fr, side, slot, dzX, dzY);
+    Serial.printf("[DZ] deadZoneMove (%d,%d) -> side=%s slot=%d abs=(%ld,%ld) wps=%d\n",
+                  ff, fr, side, slot, dzX, dzY, (int)n);
     return;
   }
 

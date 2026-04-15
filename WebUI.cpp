@@ -1187,11 +1187,21 @@ function allSquares(){
   return out;
 }
 
-function findSquareWithBase(work, base, avoidSq){
+function findSquareWithBase(work, base, avoidSq, target){
+  // First pass: prefer pieces that are NOT already at a valid target position.
+  // This ensures a displaced piece (e.g. bishop moved to d3) is chosen before
+  // an in-place piece (e.g. bishop already at its target f1).
   for(const sq of allSquares()){
     if(sq === avoidSq) continue;
     const p = work[sq];
-    if(pieceBaseId(p) === base) return sq;
+    if(pieceBaseId(p) !== base) continue;
+    if(target && pieceBaseId(target[sq]) === base) continue; // already at target — defer
+    return sq;
+  }
+  // Second pass: any piece of this type (all same-type pieces are at target positions).
+  for(const sq of allSquares()){
+    if(sq === avoidSq) continue;
+    if(pieceBaseId(work[sq]) === base) return sq;
   }
   return null;
 }
@@ -1230,8 +1240,12 @@ function buildPhysicalResetPlan(currentBoard){
     const curBase = pieceBaseId(work[targetSq]);
     if(curBase === wantBase) continue;
 
-    const srcSq = findSquareWithBase(work, wantBase, targetSq);
+    const srcSq = findSquareWithBase(work, wantBase, targetSq, target);
     if(!srcSq) continue;
+    // If the only available piece is already at a valid target position, moving
+    // it would create a circular move (happens when a piece was captured and
+    // cannot be restored).  Leave it in place and skip this target square.
+    if(target[srcSq] && pieceBaseId(target[srcSq]) === wantBase) continue;
 
     if(work[targetSq]) {
       const blocked = {};
@@ -1466,14 +1480,43 @@ const pid = boardState[key];
   }
 }
 
+  // Find the shortest BFS path from a board square to any unoccupied edge square
+  // on the given dead-zone side (L = file 0, R = file 7).  Falls back to
+  // occupied edge squares if every edge square is blocked.
+  function findPathToDeadZoneSide(board, from, side) {
+    const targetFile = (side === 'L') ? 0 : 7;
+    let bestPath = null;
+    // First pass: only target empty edge squares so we don't drag other pieces.
+    for (let r = 1; r <= 8; r++) {
+      if (getPieceAt(board, targetFile, r) && !(targetFile === from.f && r === from.r)) continue;
+      const p = findShortestPath(board, from, {f: targetFile, r});
+      if (p && (!bestPath || p.length < bestPath.length)) bestPath = p;
+    }
+    // Second pass: if every edge square was occupied, allow any.
+    if (!bestPath) {
+      for (let r = 1; r <= 8; r++) {
+        const p = findShortestPath(board, from, {f: targetFile, r});
+        if (p && (!bestPath || p.length < bestPath.length)) bestPath = p;
+      }
+    }
+    return bestPath;
+  }
+
   // Send a dead-zone move for a captured piece then track it in the UI state.
   // Must be called BEFORE the capturing piece's move command so the queue
   // executes them in order: clear the square, then occupy it.
+  // Uses BFS to navigate around other pieces on the way to the board edge.
   function sendCaptureToDeadZone(capturedPid, f, r) {
     if (!capturedPid) return;
     const side = pieceColor(capturedPid) === 'w' ? 'L' : 'R';
     const slot = side === 'L' ? deadZones.nextL : deadZones.nextR;
-    if (slot >= 0) send({cmd:"deadZoneMove", ff:f, fr:r, side, slot});
+    if (slot >= 0) {
+      const cmd = {cmd:"deadZoneMove", ff:f, fr:r, side, slot};
+      const path = findPathToDeadZoneSide(boardState, {f, r}, side);
+      // Only include path when there are intermediate squares (path > just the source).
+      if (path && path.length > 1) cmd.path = path;
+      send(cmd);
+    }
     addToCapturedZone(capturedPid, side);
   }
 

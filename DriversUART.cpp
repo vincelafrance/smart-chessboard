@@ -99,11 +99,15 @@ void initDriversUART() {
 
   leftDriver.begin();
   leftDriver.toff(4);
-  leftDriver.pwm_autoscale(true);
+  leftDriver.en_spreadCycle(false);   // StealthChop2 (smooth, quiet)
+  leftDriver.pwm_autoscale(true);     // automatic amplitude adaptation
+  leftDriver.pwm_autograd(true);      // automatic gradient adaptation — smoother torque at low speed
 
   rightDriver.begin();
   rightDriver.toff(4);
+  rightDriver.en_spreadCycle(false);
   rightDriver.pwm_autoscale(true);
+  rightDriver.pwm_autograd(true);
 
   uint8_t lconn = leftDriver.test_connection();
   uint8_t rconn = rightDriver.test_connection();

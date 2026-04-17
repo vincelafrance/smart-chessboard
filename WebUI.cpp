@@ -130,6 +130,20 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 .sq.calibDim{opacity:.2;pointer-events:none;}
 #calibValidate.calib-dirty{background:#ff6b6b !important;color:#fff !important;}
 #calibValidate.calib-ok{background:#1dd1a1 !important;color:#000 !important;}
+
+/* ── Camera tracking ─────────────────────────────────── */
+#camVideoWrap{display:none;margin-top:10px;position:relative;line-height:0;border-radius:10px;overflow:hidden}
+#camVideo{display:block;width:100%;max-width:480px}
+#camPhotoDisplay{display:none;width:100%;max-width:480px;border-radius:10px}
+#camFileInput{display:none}
+#camOverlay,#camCalibCanvas{position:absolute;top:0;left:0;width:100%;height:100%}
+#camCalibCanvas{cursor:crosshair;display:none}
+#camCalibInstr{display:none;margin-top:8px;font-size:13px;padding:8px 10px;border-radius:8px;
+  background:rgba(249,202,36,.08);border:1px solid rgba(249,202,36,.5);color:#f9ca24}
+#camSnapBtn{font-size:42px;width:80px;height:80px;border-radius:50%;
+  background:#1dd1a1;color:#000;border:none;box-shadow:0 4px 18px rgba(29,209,161,.35)}
+#camSnapBtn:active{transform:scale(.93)}
+#camStatus.cam-ok{color:#1dd1a1}#camStatus.cam-warn{color:#f9ca24}#camStatus.cam-err{color:#ff6b6b}
 </style>
 </head>
 <body>
@@ -311,6 +325,32 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
           <button class="mini" id="swapMove" style="margin-top:10px;width:100%;">🔁 Swap</button>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
+        <h1 style="margin:0;flex:1">📷 Suivi caméra</h1>
+        <button class="mini" id="camToggleBtn">📷 Activer</button>
+        <button class="mini" id="camCalibrateBtn" style="display:none">🎯 Calibrer</button>
+        <button class="mini" id="camResetBtn" style="display:none;padding:10px 8px" title="Effacer calibration">🗑</button>
+      </div>
+      <div style="font-size:12px;opacity:.55;margin-bottom:8px">
+        Détecte les coups joués manuellement — zéro charge ESP32.
+      </div>
+      <div id="camVideoWrap">
+        <video id="camVideo" autoplay playsinline muted></video>
+        <img id="camPhotoDisplay" alt="">
+        <canvas id="camOverlay"></canvas>
+        <canvas id="camCalibCanvas"></canvas>
+        <input type="file" id="camFileInput" accept="image/*" capture="environment">
+      </div>
+      <div id="camCalibInstr"></div>
+      <!-- Big snap button — shown centred below the preview in photo mode -->
+      <div id="camSnapWrap" style="display:none;text-align:center;margin-top:14px">
+        <button id="camSnapBtn" title="Prendre une photo du plateau">📸</button>
+        <div id="camSnapHint" style="font-size:11px;opacity:.6;margin-top:6px">Après chaque coup</div>
+      </div>
+      <div id="camStatus" style="margin-top:10px;font-size:13px;min-height:18px"></div>
     </div>
 
     <div class="card">
@@ -1480,41 +1520,104 @@ const pid = boardState[key];
   }
 }
 
-  // Find the shortest BFS path from a board square to any unoccupied edge square
-  // on the given dead-zone side (L = file 0, R = file 7).  Falls back to
-  // occupied edge squares if every edge square is blocked.
-  function findPathToDeadZoneSide(board, from, side) {
-    const targetFile = (side === 'L') ? 0 : 7;
-    let bestPath = null;
-    // First pass: only target empty edge squares so we don't drag other pieces.
-    for (let r = 1; r <= 8; r++) {
-      if (getPieceAt(board, targetFile, r) && !(targetFile === from.f && r === from.r)) continue;
-      const p = findShortestPath(board, from, {f: targetFile, r});
-      if (p && (!bestPath || p.length < bestPath.length)) bestPath = p;
-    }
-    // Second pass: if every edge square was occupied, allow any.
-    if (!bestPath) {
-      for (let r = 1; r <= 8; r++) {
-        const p = findShortestPath(board, from, {f: targetFile, r});
-        if (p && (!bestPath || p.length < bestPath.length)) bestPath = p;
+  // BFS on the 9×9 intersection grid (UV integer coordinates 0..8 × 0..8).
+  // Each node is a corner between squares, so the magnet never passes through a
+  // square centre and cannot accidentally drag a piece sitting on that centre.
+  // Diagonal moves between adjacent intersections are the only ones that cross
+  // a square centre; those moves are blocked when the crossed square is occupied
+  // (the captured piece's own square is exempted because it will have been picked up).
+  // Returns [{u, v}, ...] UV integer waypoints, or null on failure.
+  function findIntersectionPathToDeadZone(board, fromF, fromR, side) {
+    const targetIX = (side === 'L') ? 0 : 8;
+
+    // The 4 corners of the source square are the BFS start nodes.
+    const starts = [
+      {ix: fromF,   iv: fromR - 1},
+      {ix: fromF+1, iv: fromR - 1},
+      {ix: fromF,   iv: fromR},
+      {ix: fromF+1, iv: fromR},
+    ];
+
+    const visited = {};
+    const prev = {};
+    const queue = [];
+
+    for (const s of starts) {
+      const k = s.ix + ',' + s.iv;
+      if (!visited[k]) {
+        visited[k] = true;
+        prev[k] = null;
+        queue.push({ix: s.ix, iv: s.iv});
       }
     }
-    return bestPath;
+
+    const dirs = [
+      {dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1},
+      {dx:1,dy:1},{dx:1,dy:-1},{dx:-1,dy:1},{dx:-1,dy:-1}
+    ];
+
+    let goalNode = null;
+
+    while (queue.length && !goalNode) {
+      const cur = queue.shift();
+      if (cur.ix === targetIX) { goalNode = cur; break; }
+
+      for (const d of dirs) {
+        const nix = cur.ix + d.dx;
+        const niv = cur.iv + d.dy;
+        if (nix < 0 || nix > 8 || niv < 0 || niv > 8) continue;
+
+        // Diagonal move crosses the square whose centre lies between the two nodes.
+        if (Math.abs(d.dx) === 1 && Math.abs(d.dy) === 1) {
+          const sqF = d.dx > 0 ? cur.ix : cur.ix - 1;
+          const sqR = d.dy > 0 ? cur.iv + 1 : cur.iv;
+          if (sqF >= 0 && sqF <= 7 && sqR >= 1 && sqR <= 8) {
+            if (!(sqF === fromF && sqR === fromR) && getPieceAt(board, sqF, sqR)) continue;
+          }
+        }
+
+        const nk = nix + ',' + niv;
+        if (visited[nk]) continue;
+        visited[nk] = true;
+        prev[nk] = cur.ix + ',' + cur.iv;
+        queue.push({ix: nix, iv: niv});
+      }
+    }
+
+    if (!goalNode) return null;
+
+    const path = [];
+    let k = goalNode.ix + ',' + goalNode.iv;
+    while (k !== null && k !== undefined) {
+      const parts = k.split(',');
+      path.push({u: parseInt(parts[0], 10), v: parseInt(parts[1], 10)});
+      k = prev[k];
+    }
+    path.reverse();
+    return path;
   }
 
   // Send a dead-zone move for a captured piece then track it in the UI state.
   // Must be called BEFORE the capturing piece's move command so the queue
   // executes them in order: clear the square, then occupy it.
   // Uses BFS to navigate around other pieces on the way to the board edge.
-  function sendCaptureToDeadZone(capturedPid, f, r) {
+  // capturerFrom / capturerTo : when provided, the dead-zone path continues
+  // directly to pick up the capturing piece and drop it at its destination,
+  // making the whole capture a single uninterrupted motion sequence.
+  function sendCaptureToDeadZone(capturedPid, f, r, capturerFrom, capturerTo) {
     if (!capturedPid) return;
     const side = pieceColor(capturedPid) === 'w' ? 'L' : 'R';
     const slot = side === 'L' ? deadZones.nextL : deadZones.nextR;
     if (slot >= 0) {
       const cmd = {cmd:"deadZoneMove", ff:f, fr:r, side, slot};
-      const path = findPathToDeadZoneSide(boardState, {f, r}, side);
-      // Only include path when there are intermediate squares (path > just the source).
-      if (path && path.length > 1) cmd.path = path;
+      const path = findIntersectionPathToDeadZone(boardState, f, r, side);
+      if (path && path.length > 0) cmd.path = path;
+      if (capturerFrom && capturerTo) {
+        cmd.capFF = capturerFrom.f;
+        cmd.capFR = capturerFrom.r;
+        cmd.capTF = capturerTo.f;
+        cmd.capTR = capturerTo.r;
+      }
       send(cmd);
     }
     addToCapturedZone(capturedPid, side);
@@ -1545,95 +1648,74 @@ const pid = boardState[key];
     const t = pieceType(pid);
 
     if (t === "K" && Math.abs(to.f - from.f) === 2) {
+      // Castling — no capture possible
       send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
     } else if (t === "N") {
+      const capturedPidN = getPieceAt(boardState, to.f, to.r);
       const path = findShortestPath(boardState, from, to);
-      if(!path || path.length < 2){
-        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
+      if(!path || path.length < 2 || path.length > MAX_WP){
+        // Fallback: squareMove (L-shape routing) + separate dead-zone command
+        sendCaptureToDeadZone(capturedPidN, to.f, to.r);
         send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
         boardState = res.nextBoard;
-        if(res.rightsUpdate){
-          castling = Object.assign({}, castling, res.rightsUpdate);
-        }
+        if(res.rightsUpdate) castling = Object.assign({}, castling, res.rightsUpdate);
         epSquare = res.epNext ? res.epNext : null;
-
         from = null; to = null; selectedPieceId = null;
         fromTxt.textContent = "--";
         toTxt.textContent = "--";
-
         turn = (turn === "w") ? "b" : "w";
         updateTurnOverlay();
-
         updateCheckState();
-        if(checkSquare){
-          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
-        } else if(res.givesCheck){
+        if(checkSquare || res.givesCheck){
           setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
         } else {
           setStatus("OK. Tour: " + (turn==="w" ? "Blancs" : "Noirs"), true);
         }
-
         renderBoard();
         saveUiState();
         return;
       }
-      if(path.length > MAX_WP){
-        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
-        send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
-        boardState = res.nextBoard;
-        if(res.rightsUpdate){
-          castling = Object.assign({}, castling, res.rightsUpdate);
-        }
-        epSquare = res.epNext ? res.epNext : null;
-
-        from = null; to = null; selectedPieceId = null;
-        fromTxt.textContent = "--";
-        toTxt.textContent = "--";
-
-        turn = (turn === "w") ? "b" : "w";
-        updateTurnOverlay();
-
-        updateCheckState();
-        if(checkSquare){
-          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
-        } else if(res.givesCheck){
-          setStatus("ÉCHEC ! Tour: " + (turn==="w" ? "Blancs" : "Noirs"), false);
-        } else {
-          setStatus("OK. Tour: " + (turn==="w" ? "Blancs" : "Noirs"), true);
-        }
-
-        renderBoard();
-        saveUiState();
-        return;
-      }
-      send({cmd:"pathMove", path});
-    } else if (isSlidingPiece(pid)) {
-      const clear = isPathClear(boardState, from, to, pid);
-      if (clear) {
-        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
-        send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+      if (capturedPidN) {
+        // Capture: chain dead-zone deposit + knight move (direct) in one sequence
+        sendCaptureToDeadZone(capturedPidN, to.f, to.r, from, to);
       } else {
-        const path = findShortestPath(boardState, from, to);
-        if(!path || path.length < 2){
-          setStatus("Chemin physique bloqué pour cette pièce.", false);
-          return;
-        }
-        if(path.length > MAX_WP){
-          setStatus("Chemin trop long pour le déplacement physique.", false);
-          return;
-        }
-        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
         send({cmd:"pathMove", path});
       }
-    } else {
-      // En passant: captured pawn is at epCaptureSq, not at `to`
-      if (res.epCaptureSq) {
-        const epSq = sqToXY(res.epCaptureSq);
-        sendCaptureToDeadZone(getPieceAt(boardState, epSq.f, epSq.r), epSq.f, epSq.r);
+    } else if (isSlidingPiece(pid)) {
+      const capturedPidS = getPieceAt(boardState, to.f, to.r);
+      if (capturedPidS) {
+        // Capture: chain dead-zone + piece move in one sequence
+        sendCaptureToDeadZone(capturedPidS, to.f, to.r, from, to);
       } else {
-        sendCaptureToDeadZone(getPieceAt(boardState, to.f, to.r), to.f, to.r);
+        // No capture — normal direct or BFS move
+        const clear = isPathClear(boardState, from, to, pid);
+        if (clear) {
+          send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+        } else {
+          const path = findShortestPath(boardState, from, to);
+          if(!path || path.length < 2){
+            setStatus("Chemin physique bloqué pour cette pièce.", false);
+            return;
+          }
+          if(path.length > MAX_WP){
+            setStatus("Chemin trop long pour le déplacement physique.", false);
+            return;
+          }
+          send({cmd:"pathMove", path});
+        }
       }
-      send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+    } else {
+      // Pawn, King (non-castling)
+      const capturedPidP = res.epCaptureSq
+        ? getPieceAt(boardState, sqToXY(res.epCaptureSq).f, sqToXY(res.epCaptureSq).r)
+        : getPieceAt(boardState, to.f, to.r);
+      const capturedPos = res.epCaptureSq ? sqToXY(res.epCaptureSq) : to;
+      if (capturedPidP) {
+        // Capture (regular or en passant): chain dead-zone + piece move in one sequence
+        sendCaptureToDeadZone(capturedPidP, capturedPos.f, capturedPos.r, from, to);
+      } else {
+        send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+      }
     }
 
     boardState = res.nextBoard;
@@ -2024,6 +2106,297 @@ const pid = boardState[key];
 
   // Hook telemetry to update the WiFi panel (called from ws.onmessage handler below via a small bridge)
   window._updateWifiPanel = updateWifiPanel;
+
+  // ============================================================
+  // Camera-based piece tracking — all processing on the phone,
+  // zero load on the ESP32.
+  //
+  // TWO modes, auto-selected:
+  //   LIVE  — getUserMedia continuous stream (HTTPS only)
+  //   PHOTO — single 📸 button per move (works on plain HTTP / iOS)
+  //
+  // UX: one tap after each manual move → move applied automatically.
+  // No confirmation step; chess-rule validation is the safety net.
+  // ============================================================
+  (function(){
+    const camToggleBtn   = document.getElementById("camToggleBtn");
+    const camCalibrateBtn= document.getElementById("camCalibrateBtn");
+    const camSnapBtn     = document.getElementById("camSnapBtn");
+    const camSnapWrap    = document.getElementById("camSnapWrap");
+    const camSnapHint    = document.getElementById("camSnapHint");
+    const camResetBtn    = document.getElementById("camResetBtn");
+    const camVideoWrap   = document.getElementById("camVideoWrap");
+    const video          = document.getElementById("camVideo");
+    const photoDisplay   = document.getElementById("camPhotoDisplay");
+    const fileInput      = document.getElementById("camFileInput");
+    const overlay        = document.getElementById("camOverlay");
+    const calibCanvas    = document.getElementById("camCalibCanvas");
+    const camStatus      = document.getElementById("camStatus");
+    const camCalibInstr  = document.getElementById("camCalibInstr");
+
+    const CAM_CALIB_KEY = "sc_camCalib_v1";
+    const CHANGE_THR    = 16;   // per-square brightness diff → piece moved
+    const SAMPLE_FRAC   = 0.30;
+    const CALIB_LABELS  = ["a8 (haut-gauche)","h8 (haut-droite)","h1 (bas-droite)","a1 (bas-gauche)"];
+    const CALIB_COLORS  = ["#1dd1a1","#54a0ff","#f9ca24","#ff6b6b"];
+    const CORNER_NAMES  = ["a8","h8","h1","a1"];
+    const STABLE_MS = 1100; const MOTION_THR = 9; const ANALYSIS_MS = 220;
+
+    const LIVE_MODE = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+    let camStream = null, camActive = false, camCalibMode = false, calibStep = 0;
+    let corners = null;        // [{x,y}×4] normalized: [a8, h8, h1, a1]
+    let offCanvas = null, offCtx = null;
+    let refSigs = null;        // Float32Array[64] — last-known board state
+    let prevSigs = null;       // live-mode previous frame
+    let lastMotionMs = 0, wasStable = false, analysisId = null;
+
+    // ── Storage ───────────────────────────────────────────────
+    function loadCorners(){ try{ const s=localStorage.getItem(CAM_CALIB_KEY); if(s){corners=JSON.parse(s);return true;}}catch(e){} return false; }
+    function saveCorners(){ try{ localStorage.setItem(CAM_CALIB_KEY,JSON.stringify(corners)); }catch(e){} }
+
+    // ── Geometry — bilinear mapping ───────────────────────────
+    function squareToNorm(f, r) {
+      const u=(f+0.5)/8, v=1-(r-0.5)/8;
+      const [tl,tr2,br,bl]=corners;
+      return { x:(1-u)*(1-v)*tl.x+u*(1-v)*tr2.x+u*v*br.x+(1-u)*v*bl.x,
+               y:(1-u)*(1-v)*tl.y+u*(1-v)*tr2.y+u*v*br.y+(1-u)*v*bl.y };
+    }
+    function squarePxSize(cw,ch){ if(!corners)return 24; const[tl,,br,]=corners; return Math.hypot((br.x-tl.x)*cw,(br.y-tl.y)*ch)/(8*Math.SQRT2); }
+
+    // ── Sampling ──────────────────────────────────────────────
+    function sampleFrom(src, cw, ch) {
+      if(!cw||!ch||!corners) return null;
+      offCanvas.width=cw; offCanvas.height=ch;
+      offCtx.drawImage(src,0,0,cw,ch);
+      const sr=Math.max(4,Math.round(squarePxSize(cw,ch)*SAMPLE_FRAC));
+      const sigs=new Float32Array(64);
+      for(let f=0;f<8;f++) for(let ri=1;ri<=8;ri++){
+        const n=squareToNorm(f,ri);
+        const cx=Math.round(n.x*cw), cy=Math.round(n.y*ch);
+        const x0=Math.max(0,cx-sr),y0=Math.max(0,cy-sr),x1=Math.min(cw,cx+sr+1),y1=Math.min(ch,cy+sr+1);
+        if(x1<=x0||y1<=y0) continue;
+        const p=offCtx.getImageData(x0,y0,x1-x0,y1-y0).data;
+        let sum=0; for(let i=0;i<p.length;i+=4) sum+=(p[i]+p[i+1]+p[i+2])/3;
+        sigs[f+(ri-1)*8]=sum/(p.length/4);
+      }
+      return sigs;
+    }
+    function sampleLive(){ return sampleFrom(video,video.videoWidth,video.videoHeight); }
+    function sampleImg(img){ return sampleFrom(img,img.naturalWidth,img.naturalHeight); }
+
+    // ── Overlay ───────────────────────────────────────────────
+    function drawOverlay(dw, dh, cur, base) {
+      if(!dw||!dh) return;
+      overlay.width=dw; overlay.height=dh;
+      const ctx=overlay.getContext("2d"); ctx.clearRect(0,0,dw,dh);
+      if(!corners) return;
+      const r=Math.max(5,Math.round(squarePxSize(dw,dh)*SAMPLE_FRAC));
+      for(let f=0;f<8;f++) for(let ri=1;ri<=8;ri++){
+        const n=squareToNorm(f,ri), cx=n.x*dw, cy=n.y*dh, idx=f+(ri-1)*8;
+        let c="rgba(255,255,255,0.15)";
+        if(cur&&base){ const d=Math.abs(cur[idx]-base[idx]); if(d>CHANGE_THR) c=getPieceAt(boardState,f,ri)?"rgba(255,80,80,.9)":"rgba(100,220,80,.9)"; }
+        ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.strokeStyle=c; ctx.lineWidth=1.5; ctx.stroke();
+      }
+      const set=camCalibMode?corners.slice(0,calibStep):corners;
+      set.forEach((c,i)=>{ const px=c.x*dw,py=c.y*dh; ctx.beginPath(); ctx.arc(px,py,8,0,Math.PI*2); ctx.fillStyle=CALIB_COLORS[i]; ctx.fill(); ctx.font="bold 8px system-ui"; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillStyle="#000"; ctx.fillText(CORNER_NAMES[i],px,py); });
+    }
+
+    // ── Auto-apply a detected move ────────────────────────────
+    // No confirmation dialog: chess-rule validation is the safety net.
+    function tryApplyMove(changed, cur, base) {
+      const froms=changed.filter(sq=>!!getPieceAt(boardState,sq.f,sq.r));
+      const tos  =changed.filter(sq=>!getPieceAt(boardState,sq.f,sq.r));
+      let fromSq=null, toSq=null;
+
+      if(froms.length===1 && tos.length===1){ fromSq=froms[0]; toSq=tos[0]; }
+      else if(froms.length===2 && tos.length===0){
+        const[a,b]=froms;
+        const dA=cur[a.f+(a.r-1)*8]-base[a.f+(a.r-1)*8];
+        const dB=cur[b.f+(b.r-1)*8]-base[b.f+(b.r-1)*8];
+        fromSq=dA>dB?a:b; toSq=dA>dB?b:a;
+        if(!validateMove(boardState,xyToSq(fromSq.f,fromSq.r),xyToSq(toSq.f,toSq.r)).ok){ const t=fromSq; fromSq=toSq; toSq=t; }
+      }
+
+      if(!fromSq||!toSq) return false;
+      const res=validateMove(boardState,xyToSq(fromSq.f,fromSq.r),xyToSq(toSq.f,toSq.r));
+      if(!res.ok){ setStatus("⚠️ Coup non reconnu — réessayez","cam-warn"); return false; }
+
+      from=fromSq; to=toSq; selectedPieceId=null;
+      fromTxt.textContent=xyToSq(from.f,from.r).toUpperCase();
+      toTxt.textContent  =xyToSq(to.f,  to.r  ).toUpperCase();
+      renderBoard();
+      executeSelectedMove();
+      setStatus("✅  " + xyToSq(fromSq.f,fromSq.r).toUpperCase() + " → " + xyToSq(toSq.f,toSq.r).toUpperCase(), "cam-ok");
+      return true;
+    }
+
+    function changedSquares(cur,base){ const o=[]; for(let f=0;f<8;f++) for(let ri=1;ri<=8;ri++) if(Math.abs(cur[f+(ri-1)*8]-base[f+(ri-1)*8])>CHANGE_THR) o.push({f,r:ri}); return o; }
+
+    function setStatus(msg, cls) {
+      camStatus.textContent = msg;
+      camStatus.className = cls || "";
+    }
+
+    // ── Calibration ───────────────────────────────────────────
+    function startCalibration() {
+      camCalibMode=true; calibStep=0; corners=[];
+      if(LIVE_MODE){
+        calibCanvas.style.display="block"; overlay.style.pointerEvents="none";
+        camCalibInstr.style.display="block";
+        camCalibInstr.textContent="Étape 1/4 — Touchez le coin "+CALIB_LABELS[0];
+      } else {
+        camCalibInstr.style.display="block";
+        camCalibInstr.textContent="Prenez une photo du plateau entier pour calibrer";
+        fileInput._purpose="calibrate"; fileInput.click();
+      }
+    }
+
+    function onCalibTap(nx, ny) {
+      corners[calibStep]={x:nx,y:ny}; calibStep++;
+      if(calibStep<4){
+        camCalibInstr.textContent="Étape "+(calibStep+1)+"/4 — Touchez le coin "+CALIB_LABELS[calibStep];
+        drawOverlay(LIVE_MODE?video.clientWidth:photoDisplay.clientWidth, LIVE_MODE?video.clientHeight:photoDisplay.clientHeight, null, null);
+      } else {
+        camCalibInstr.style.display="none"; calibCanvas.style.display="none"; overlay.style.pointerEvents=""; camCalibMode=false;
+        saveCorners();
+        refSigs=null; prevSigs=null; wasStable=false; lastMotionMs=Date.now();
+        if(LIVE_MODE){
+          drawOverlay(video.clientWidth,video.clientHeight,null,null);
+          setStatus("✅ Calibration enregistrée — surveillance active","cam-ok");
+        } else {
+          camSnapWrap.style.display="block";
+          camSnapHint.textContent="Première photo = référence";
+          setStatus("✅ Calibration enregistrée — tapez 📸 pour initialiser","cam-ok");
+          drawOverlay(photoDisplay.clientWidth,photoDisplay.clientHeight,null,null);
+        }
+      }
+    }
+
+    calibCanvas.addEventListener("click", e => {
+      const r=calibCanvas.getBoundingClientRect();
+      onCalibTap((e.clientX-r.left)/r.width, (e.clientY-r.top)/r.height);
+    });
+
+    // ── Live analysis loop ────────────────────────────────────
+    function runAnalysis() {
+      if(!camActive||!corners) return;
+      const cur=sampleLive(); if(!cur) return;
+      let mx=0;
+      if(prevSigs) for(let i=0;i<64;i++) mx=Math.max(mx,Math.abs(cur[i]-prevSigs[i]));
+      prevSigs=cur;
+      const now=Date.now();
+      if(mx>MOTION_THR){ lastMotionMs=now; wasStable=false; }
+      else if(!wasStable&&(now-lastMotionMs)>STABLE_MS){
+        if(refSigs){ const ch=changedSquares(cur,refSigs); if(ch.length>=1&&ch.length<=4) tryApplyMove(ch,cur,refSigs); }
+        refSigs=cur; wasStable=true;
+        if(camStatus.className!=="cam-ok") setStatus("👁 Surveillance active","");
+      }
+      drawOverlay(video.clientWidth,video.clientHeight,wasStable?cur:null,refSigs);
+    }
+
+    // ── Photo mode — single tap ───────────────────────────────
+    function loadImgFromFile(file){ return new Promise(res=>{ const u=URL.createObjectURL(file); const i=new Image(); i.onload=()=>{ i._url=u; res(i); }; i.src=u; }); }
+
+    fileInput.addEventListener("change", async e => {
+      const file=e.target.files[0]; if(!file) return; e.target.value="";
+      const img=await loadImgFromFile(file);
+
+      if(fileInput._purpose==="calibrate"){
+        photoDisplay.onload=()=>{
+          camVideoWrap.style.display="block";
+          calibCanvas.style.display="block"; overlay.style.pointerEvents="none"; calibCanvas.style.pointerEvents="auto";
+          camCalibInstr.style.display="block";
+          camCalibInstr.textContent="Étape 1/4 — Touchez le coin "+CALIB_LABELS[0];
+          drawOverlay(photoDisplay.clientWidth,photoDisplay.clientHeight,null,null);
+        };
+        photoDisplay.src=img._url; photoDisplay.style.display="block"; video.style.display="none";
+        return;
+      }
+
+      // Snap: any press after calibration does reference-or-analyze automatically
+      const cur=sampleImg(img); if(!cur){ setStatus("❌ Lecture photo échouée","cam-err"); return; }
+      photoDisplay.src=img._url; photoDisplay.style.display="block"; video.style.display="none";
+      camVideoWrap.style.display="block";
+
+      if(!refSigs){
+        // First photo → silent reference
+        refSigs=cur;
+        drawOverlay(photoDisplay.clientWidth,photoDisplay.clientHeight,null,null);
+        camSnapHint.textContent="Après chaque coup";
+        setStatus("✅ Référence prise — tapez 📸 après chaque coup","cam-ok");
+        return;
+      }
+
+      // Subsequent photo → detect and auto-apply
+      const prevRef=refSigs;
+      const changed=changedSquares(cur,prevRef);
+      drawOverlay(photoDisplay.clientWidth,photoDisplay.clientHeight,cur,prevRef);
+      refSigs=cur; // always advance reference regardless of result
+      if(changed.length===0){
+        setStatus("🤷 Aucun changement — plateau identique","cam-warn");
+      } else if(changed.length>4){
+        setStatus("⚠️ Trop de changements ("+changed.length+") — éclairage instable?","cam-warn");
+      } else {
+        tryApplyMove(changed,cur,prevRef);
+      }
+    });
+
+    // ── Start / stop ──────────────────────────────────────────
+    async function startCamera() {
+      offCanvas=document.createElement("canvas");
+      offCtx=offCanvas.getContext("2d",{willReadFrequently:true});
+      if(LIVE_MODE){
+        setStatus("⏳ Accès caméra…","");
+        try {
+          camStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}}});
+          video.srcObject=camStream;
+          await new Promise(r=>{video.onloadedmetadata=r;}); video.play();
+          video.style.display="block"; camVideoWrap.style.display="block"; camActive=true;
+          camCalibrateBtn.style.display=""; camResetBtn.style.display="";
+          camToggleBtn.textContent="📷 Désactiver";
+          if(loadCorners()){ refSigs=null; wasStable=false; lastMotionMs=Date.now(); setStatus("👁 Surveillance active",""); }
+          else setStatus("🎯 Calibrez d'abord le plateau","cam-warn");
+          analysisId=setInterval(runAnalysis,ANALYSIS_MS);
+        } catch(e){ setStatus("❌ "+e.message,"cam-err"); }
+      } else {
+        camActive=true;
+        camCalibrateBtn.style.display=""; camResetBtn.style.display="";
+        camToggleBtn.textContent="📷 Désactiver";
+        if(loadCorners()){
+          camSnapWrap.style.display="block";
+          camSnapHint.textContent="Première photo = référence";
+          setStatus("✅ Prêt — tapez 📸 pour initialiser","cam-ok");
+        } else {
+          setStatus("🎯 Calibrez d'abord le plateau (bouton Calibrer)","cam-warn");
+        }
+      }
+    }
+
+    function stopCamera() {
+      clearInterval(analysisId); analysisId=null;
+      if(camStream){ camStream.getTracks().forEach(t=>t.stop()); camStream=null; }
+      video.srcObject=null;
+      camVideoWrap.style.display="none"; video.style.display="block"; photoDisplay.style.display="none";
+      camCalibrateBtn.style.display="none"; camSnapWrap.style.display="none";
+      camResetBtn.style.display="none"; camCalibInstr.style.display="none";
+      calibCanvas.style.display="none";
+      camToggleBtn.textContent="📷 Activer";
+      camActive=camCalibMode=false; refSigs=prevSigs=null;
+      setStatus("","");
+    }
+
+    // ── Buttons ───────────────────────────────────────────────
+    camToggleBtn.addEventListener("click",    ()=>camActive?stopCamera():startCamera());
+    camCalibrateBtn.addEventListener("click", startCalibration);
+    camSnapBtn.addEventListener("click", ()=>{ if(!camActive) return; fileInput._purpose="snap"; fileInput.click(); });
+    camResetBtn.addEventListener("click", ()=>{
+      corners=null; try{localStorage.removeItem(CAM_CALIB_KEY);}catch(e){}
+      refSigs=prevSigs=null; camSnapWrap.style.display="none";
+      overlay.getContext("2d").clearRect(0,0,overlay.width,overlay.height);
+      setStatus("Calibration effacée — recalibrez le plateau","cam-warn");
+    });
+  })();
 
   const wifiSaveBtn = document.getElementById("wifiSaveBtn");
   if (wifiSaveBtn) wifiSaveBtn.addEventListener("click", () => {

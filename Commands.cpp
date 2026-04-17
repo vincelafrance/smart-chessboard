@@ -266,7 +266,7 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   }
 
   // { "cmd": "deadZoneMove", "ff": file, "fr": rank, "side": "L"|"R", "slot": 0..15,
-  //   "path": [{f,r},...] (optional BFS waypoints from source to board edge) }
+  //   "path": [{u,v},...] (optional intersection UV waypoints, integers 0..8) }
   // Pick up the piece at (ff,fr), navigate via BFS path if provided to avoid
   // collisions, then deliver to the physical dead-zone slot.
   if (strcmp(cmd, "deadZoneMove") == 0) {
@@ -293,37 +293,85 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     m.type = PM_PATH;
     uint8_t n = 0;
 
-    // If the UI provided a BFS board path, follow it to avoid piece collisions.
+    // Parse optional capturer move (capFF/capFR = FROM, capTF/capTR = TO).
+    // When present the path continues directly to pick up and place the
+    // capturing piece, making the whole capture a single uninterrupted motion.
+    bool hasCapMove = doc.containsKey("capFF") && doc.containsKey("capFR") &&
+                      doc.containsKey("capTF") && doc.containsKey("capTR");
+    int capFF_v = hasCapMove ? (int)doc["capFF"] : -1;
+    int capFR_v = hasCapMove ? (int)doc["capFR"] : -1;
+    int capTF_v = hasCapMove ? (int)doc["capTF"] : -1;
+    int capTR_v = hasCapMove ? (int)doc["capTR"] : -1;
+    if (hasCapMove && (capFF_v < 0 || capFF_v > 7 || capFR_v < 1 || capFR_v > 8 ||
+                       capTF_v < 0 || capTF_v > 7 || capTR_v < 1 || capTR_v > 8))
+      hasCapMove = false;
+
+    // First waypoint is always the captured piece's centre (pick-up point).
+    m.wps[n++] = { srcX, srcY, -1 };  // mag set to 1 below
+
+    // If the UI provided an intersection path, follow it to avoid piece collisions.
+    // Path entries are {u,v} UV integers (0..8) for intersection-grid waypoints.
+    // Reserve 3 slots: dead-zone + (capturer FROM + TO) or (return waypoint).
     if (doc.containsKey("path")) {
       JsonArray pathArr = doc["path"].as<JsonArray>();
       if (!pathArr.isNull() && pathArr.size() >= 1) {
         for (JsonVariant v : pathArr) {
-          if (n >= MAX_WAYPOINTS - 1) break;  // reserve one slot for dead-zone
+          if (n >= MAX_WAYPOINTS - 3) break;
           if (!v.is<JsonObject>()) continue;
           JsonObject obj = v.as<JsonObject>();
-          if (!obj.containsKey("f") || !obj.containsKey("r")) continue;
-          int pf = (int)obj["f"];
-          int pr = (int)obj["r"];
-          if (pf < 0 || pf > 7 || pr < 1 || pr > 8) continue;
           long wx, wy;
-          squareCenterSteps((uint8_t)pf, (uint8_t)pr, wx, wy);
+          if (obj.containsKey("u") && obj.containsKey("v")) {
+            float pu = obj["u"].as<float>();
+            float pv = obj["v"].as<float>();
+            boardUVToXY(pu, pv, wx, wy);
+            long xMin, xMax, yMin, yMax;
+            getXLimits(xMin, xMax); getYLimits(yMin, yMax);
+            wx = clampl(wx, xMin + EDGE_STOP_DIST, xMax - EDGE_STOP_DIST);
+            wy = clampl(wy, yMin + EDGE_STOP_DIST, yMax - EDGE_STOP_DIST);
+          } else if (obj.containsKey("f") && obj.containsKey("r")) {
+            int pf = (int)obj["f"], pr = (int)obj["r"];
+            if (pf < 0 || pf > 7 || pr < 1 || pr > 8) continue;
+            squareCenterSteps((uint8_t)pf, (uint8_t)pr, wx, wy);
+          } else {
+            continue;
+          }
+          if (wx == m.wps[n-1].x && wy == m.wps[n-1].y) continue;
           m.wps[n++] = { wx, wy, -1 };
         }
       }
     }
 
-    // If no path waypoints were added, fall back to a direct source → dead-zone move.
-    if (n == 0) {
-      m.wps[n++] = { srcX, srcY, -1 };
+    // Remember the last board-side waypoint (within normal Y limits).
+    long retX = m.wps[n - 1].x;
+    long retY = m.wps[n - 1].y;
+
+    // Dead zone drop waypoint.
+    uint8_t dzIdx = n;
+    m.wps[n++] = { dzX, dzY, -1 };
+
+    if (hasCapMove) {
+      // Continue directly to the capturing piece then move it to its destination.
+      // The path ends at a normal board square so g_dzPathYExpanded is cleared
+      // only once the carriage is back within normal Y limits.
+      long capFromX, capFromY, capToX, capToY;
+      squareCenterSteps((uint8_t)capFF_v, (uint8_t)capFR_v, capFromX, capFromY);
+      squareCenterSteps((uint8_t)capTF_v, (uint8_t)capTR_v, capToX,   capToY);
+      m.wps[n++] = { capFromX, capFromY, 1 };  // pick up capturing piece
+      m.wps[n++] = { capToX,   capToY,   0 };  // drop at destination
+    } else {
+      // No capturer chaining: return to the board-edge square so the carriage
+      // exits the expanded Y zone before g_dzPathYExpanded is cleared.
+      m.wps[n++] = { retX, retY, -1 };
     }
 
-    // Dead zone is the final destination.
-    m.wps[n++] = { dzX, dzY, -1 };
     m.n = n;
 
-    // First waypoint = pick up piece; last waypoint = drop at dead zone.
-    m.wps[0].mag = 1;
-    m.wps[n - 1].mag = 0;
+    // Magnet assignments:
+    //   wps[0]     = pick up captured piece
+    //   wps[dzIdx] = drop at dead-zone slot
+    //   capturer FROM/TO mags are already set inline above (1 / 0)
+    m.wps[0].mag    = 1;
+    m.wps[dzIdx].mag = 0;
 
     enqueueOrExecute(m);
     Serial.printf("[DZ] deadZoneMove (%d,%d) -> side=%s slot=%d abs=(%ld,%ld) wps=%d\n",

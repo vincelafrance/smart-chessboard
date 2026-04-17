@@ -279,26 +279,25 @@ if (fr == tr && ff == 4 && (fr == 1 || fr == 8) && (int)abs((int)tf - (int)ff) =
   squareCenterSteps(ff,    rank, kingSX, kingSY);
   squareCenterSteps(kingT0,rank, kingTX, kingTY);
 
-  // Intersection point: midpoint between rook final and king final (between adjacent squares)
-  long ix, iy;
-  midpointClamped(rookTX, rookTY, kingTX, kingTY, ix, iy);
+  // Rook routes via the rank border (v=0 for rank 1, v=8 for rank 8) so it
+  // never passes over the king's new square or any other piece on that rank.
+  float vEdge = (rank == 1) ? 0.0f : 8.0f;
+  long rookEdgeSX, rookEdgeSY, rookEdgeTX, rookEdgeTY;
+  uvToXY_clamped((float)rookF0, vEdge, rookEdgeSX, rookEdgeSY);
+  uvToXY_clamped((float)rookT0, vEdge, rookEdgeTX, rookEdgeTY);
 
-  // Build one combined waypoint sequence with waypoint-driven magnet toggles:
-  // 1) Go to rook start, pick rook
-  // 2) Move rook to intersection, drop rook
-  // 3) Go to king start, pick king
-  // 4) Move king to final, drop king
-  // 5) Go to intersection, pick rook
-  // 6) Move rook to final, drop rook
+  // Sequence:
+  // 1) Move king directly to its final square
+  // 2) Pick rook, duck below/above the rank border, travel to rook dest column, drop
   Waypoint wps[12];
   uint8_t n = 0;
 
-  wps[n++] = { rookSX, rookSY,  1 };   // pick rook
-  wps[n++] = { ix,     iy,      0 };   // drop rook at intersection
-  wps[n++] = { kingSX, kingSY,  1 };   // pick king
-  wps[n++] = { kingTX, kingTY,  0 };   // drop king
-  wps[n++] = { ix,     iy,      1 };   // pick rook again
-  wps[n++] = { rookTX, rookTY,  0 };   // drop rook at final
+  wps[n++] = { kingSX,     kingSY,     1 };  // pick king
+  wps[n++] = { kingTX,     kingTY,     0 };  // drop king at final
+  wps[n++] = { rookSX,     rookSY,     1 };  // pick rook
+  wps[n++] = { rookEdgeSX, rookEdgeSY, -1 }; // move to rank border below/above start
+  wps[n++] = { rookEdgeTX, rookEdgeTY, -1 }; // travel along border to dest column
+  wps[n++] = { rookTX,     rookTY,     0 };  // drop rook at final
 
   beginMoveSeq(wps, n);
 

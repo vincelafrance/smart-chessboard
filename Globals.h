@@ -36,8 +36,8 @@ extern unsigned long lastHallPollMs;
 static const long  Y_SPAN_STEPS   = 9300;
 static const long  X_SPAN_STEPS   = 8525;
 
-static const float CALIB_Y_SPEED  = 2000.0f;
-static const float CALIB_X_SPEED  = 2000.0f;
+static const float CALIB_Y_SPEED  = 4000.0f;
+static const float CALIB_X_SPEED  = 4000.0f;
 
 static const int   CALIB_Y_DIR    = -1;
 static const int   CALIB_X_DIR    = -1;

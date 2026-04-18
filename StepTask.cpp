@@ -244,6 +244,7 @@ static void stepTask(void *param) {
         // carriage moving at its current rate for the 1 ms until the next
         // velocity update picks up the new target.
         if (!needsSettle) {
+          bool flyDone = false;
           portENTER_CRITICAL(&gMux);
           uint8_t idx = g_wpIndex;
           uint8_t c   = g_wpCount;
@@ -253,6 +254,7 @@ static void stepTask(void *param) {
             g_wpCount    = 0;
             g_wpIndex    = 0;
             g_dzPathYExpanded = false;
+            flyDone = true;
           } else {
             g_wpIndex      = idx;
             g_pathTargetX  = g_waypoints[idx].x;
@@ -260,6 +262,7 @@ static void stepTask(void *param) {
           }
           g_lastCmdMs = nowMs;
           portEXIT_CRITICAL(&gMux);
+          if (flyDone) Serial.printf("[PATH] fly done at wp %u/%u dzExp=0\n", (unsigned)(idx-1), (unsigned)c);
 
           settleStartMs = 0;
           vTaskDelay(1);
@@ -322,6 +325,9 @@ static void stepTask(void *param) {
           }
         }
 
+        bool settleDone = false;
+        long logTx = 0, logTy = 0;
+        int8_t logMag = -1;
         portENTER_CRITICAL(&gMux);
         uint8_t idx = g_wpIndex;
         uint8_t c   = g_wpCount;
@@ -331,13 +337,22 @@ static void stepTask(void *param) {
           g_wpCount    = 0;
           g_wpIndex    = 0;
           g_dzPathYExpanded = false;
+          settleDone = true;
         } else {
           g_wpIndex      = idx;
           g_pathTargetX  = g_waypoints[idx].x;
           g_pathTargetY  = g_waypoints[idx].y;
+          logTx  = g_waypoints[idx].x;
+          logTy  = g_waypoints[idx].y;
+          logMag = g_waypoints[idx].mag;
         }
         g_lastCmdMs = nowMs;
         portEXIT_CRITICAL(&gMux);
+        if (settleDone)
+          Serial.printf("[PATH] done at wp %u/%u dzExp=0\n", (unsigned)(idx-1), (unsigned)c);
+        else
+          Serial.printf("[PATH] wp %u->%u mag=%d target=(%ld,%ld)\n",
+                        (unsigned)(idx-1), (unsigned)idx, (int)logMag, logTx, logTy);
 
         settleStartMs = 0;
         vx_t = 0.0f;

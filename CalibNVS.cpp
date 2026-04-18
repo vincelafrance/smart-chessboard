@@ -1,6 +1,7 @@
 #include "CalibNVS.h"
 #include "Globals.h"
 #include "BoardMapping.h"
+#include "WebUI.h"
 #include <Preferences.h>
 
 static const char NVS_NS[]   = "chess_calib";   // namespace (≤15 chars)
@@ -75,6 +76,15 @@ bool loadCalibFromNVS() {
 
     Serial.printf("[CALIB NVS] Loaded: A1=(%ld,%ld) H1=(%ld,%ld) A8=(%ld,%ld) H8=(%ld,%ld) origin=(%ld,%ld)\n",
                   a1cx, a1cy, h1cx, h1cy, a8cx, a8cy, h8cx, h8cy, origx, origy);
+    Serial.printf("[CALIB NVS] DZ L cal=%d bas=(%ld,%ld) haut=(%ld,%ld)\n",
+                  (int)dzlcal, dzlbx, dzlby, dzlhx, dzlhy);
+    Serial.printf("[CALIB NVS] DZ R cal=%d bas=(%ld,%ld) haut=(%ld,%ld)\n",
+                  (int)dzrcal, dzrbx, dzrby, dzrhx, dzrhy);
+    // Also push to browser once connected (broadcastTXT is a no-op if no client yet)
+    webLog("[NVS] DZ L cal=%d bas=(%ld,%ld) haut=(%ld,%ld)",
+           (int)dzlcal, dzlbx, dzlby, dzlhx, dzlhy);
+    webLog("[NVS] DZ R cal=%d bas=(%ld,%ld) haut=(%ld,%ld)",
+           (int)dzrcal, dzrbx, dzrby, dzrhx, dzrhy);
     return true;
 }
 

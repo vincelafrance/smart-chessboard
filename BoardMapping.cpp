@@ -1,4 +1,5 @@
 #include "BoardMapping.h"
+#include "WebUI.h"
 #include "Utils.h"
 #include "MotionCoreXY.h"
 
@@ -10,12 +11,20 @@ void boardUpdateFromOrigin(long oxAbs, long oyAbs) {
   // and the corners start at REF values (OFF_xxx), so the delta = oxAbs gives
   // exactly oxAbs + OFF_xxx — same as the old absolute reset.
   long lastX, lastY, A1cx, A1cy, H1cx, H1cy, A8cx, A8cy, H8cx, H8cy;
+  long dzlbx, dzlby, dzlhx, dzlhy, dzrbx, dzrby, dzrhx, dzrhy;
+  bool dzlcal, dzrcal;
   portENTER_CRITICAL(&gMux);
   lastX = g_lastOrigin_X; lastY = g_lastOrigin_Y;
   A1cx = g_A1C_X; A1cy = g_A1C_Y;
   H1cx = g_H1C_X; H1cy = g_H1C_Y;
   A8cx = g_A8C_X; A8cy = g_A8C_Y;
   H8cx = g_H8C_X; H8cy = g_H8C_Y;
+  dzlbx = g_DZ_L_Bas_X;  dzlby = g_DZ_L_Bas_Y;
+  dzlhx = g_DZ_L_Haut_X; dzlhy = g_DZ_L_Haut_Y;
+  dzrbx = g_DZ_R_Bas_X;  dzrby = g_DZ_R_Bas_Y;
+  dzrhx = g_DZ_R_Haut_X; dzrhy = g_DZ_R_Haut_Y;
+  dzlcal = g_DZ_L_Calibrated;
+  dzrcal = g_DZ_R_Calibrated;
   portEXIT_CRITICAL(&gMux);
 
   long dx = oxAbs - lastX;
@@ -25,6 +34,11 @@ void boardUpdateFromOrigin(long oxAbs, long oyAbs) {
   H1cx += dx; H1cy += dy;
   A8cx += dx; A8cy += dy;
   H8cx += dx; H8cy += dy;
+
+  // Dead zone endpoints are stored in absolute step coordinates — shift them
+  // by the same delta so they stay aligned with the board after recalibration.
+  if (dzlcal) { dzlbx += dx; dzlby += dy; dzlhx += dx; dzlhy += dy; }
+  if (dzrcal) { dzrbx += dx; dzrby += dy; dzrhx += dx; dzrhy += dy; }
 
   float fileVx = (float)(H1cx - A1cx) / 7.0f;
   float fileVy = (float)(H1cy - A1cy) / 7.0f;
@@ -54,10 +68,14 @@ void boardUpdateFromOrigin(long oxAbs, long oyAbs) {
   g_BO_H1_X=BO_H1x; g_BO_H1_Y=BO_H1y;
   g_BO_A8_X=BO_A8x; g_BO_A8_Y=BO_A8y;
   g_BO_H8_X=BO_H8x; g_BO_H8_Y=BO_H8y;
+
+  if (dzlcal) { g_DZ_L_Bas_X=dzlbx; g_DZ_L_Bas_Y=dzlby; g_DZ_L_Haut_X=dzlhx; g_DZ_L_Haut_Y=dzlhy; }
+  if (dzrcal) { g_DZ_R_Bas_X=dzrbx; g_DZ_R_Bas_Y=dzrby; g_DZ_R_Haut_X=dzrhx; g_DZ_R_Haut_Y=dzrhy; }
   portEXIT_CRITICAL(&gMux);
 
-  Serial.printf("[BOARD] centerAbs=%ld,%ld delta=%ld,%ld outerA1Abs=%ld,%ld\n",
-                oxAbs, oyAbs, dx, dy, BO_A1x, BO_A1y);
+  Serial.printf("[BOARD] centerAbs=%ld,%ld delta=%ld,%ld outerA1Abs=%ld,%ld dzShift=%s\n",
+                oxAbs, oyAbs, dx, dy, BO_A1x, BO_A1y,
+                (dzlcal || dzrcal) ? "yes" : "no");
   g_calibNvsDirty   = true;
   g_calibNvsDirtyMs = millis();
 }
@@ -169,6 +187,8 @@ void deadZoneSlotPos(char side, uint8_t slot, long &xOut, long &yOut) {
     long yStep   = yRange / 15;
     xOut = xEdge;
     yOut = yBase + (long)slot * yStep;
+    webLog("[DZ] slotPos side=%c slot=%u FALLBACK (not calibrated) -> (%ld,%ld)",
+           side, slot, xOut, yOut);
     return;
   }
 
@@ -177,6 +197,8 @@ void deadZoneSlotPos(char side, uint8_t slot, long &xOut, long &yOut) {
   float t = (float)(15 - slot) / 15.0f;
   xOut = basX + (long)lroundf(t * (float)(hautX - basX));
   yOut = basY + (long)lroundf(t * (float)(hautY - basY));
+  webLog("[DZ] slotPos side=%c slot=%u CALIBRATED bas=(%ld,%ld) haut=(%ld,%ld) -> (%ld,%ld)",
+         side, slot, basX, basY, hautX, hautY, xOut, yOut);
 }
 
 void squareEdgeMidpoint(uint8_t f0, uint8_t r1, int dirX, int dirY, long &exAbs, long &eyAbs) {

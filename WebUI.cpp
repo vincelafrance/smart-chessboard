@@ -1821,6 +1821,29 @@ const pid = boardState[key];
         if (d.type === "tuneLog" && typeof d.msg === "string") {
           appendTuneLog(d.msg);
         }
+        // Firmware diagnostic log — forwarded to browser console
+        if (d.type === "log" && typeof d.msg === "string") {
+          console.log("[FW]", d.msg);
+        }
+        // Path progression tracking
+        if (typeof d.path !== "undefined") {
+          const wasPath = window._scLastPath || false;
+          const lastWp  = window._scLastWpIdx;
+          const lastCnt = window._scLastWpCnt;
+          const nowPath = !!d.path;
+          const nowWp   = d.wpIdx|0;
+          const nowCnt  = d.wpCnt|0;
+          const nowDz   = !!d.dzExp;
+          if (!wasPath && nowPath)
+            console.log("[PATH] started wpCnt=" + nowCnt + " dzExp=" + nowDz);
+          if (wasPath && !nowPath)
+            console.log("[PATH] finished");
+          if (nowPath && nowWp !== lastWp)
+            console.log("[PATH] wp " + (lastWp||0) + " -> " + nowWp + "/" + nowCnt + " dzExp=" + nowDz);
+          window._scLastPath  = nowPath;
+          window._scLastWpIdx = nowWp;
+          window._scLastWpCnt = nowCnt;
+        }
         // Chess Test Run telemetry
         if (typeof d.testRun !== "undefined") {
           updateTestRunUI(
@@ -2435,6 +2458,19 @@ void webLoop() {
   webSocket.loop();
 }
 
+void webLog(const char* fmt, ...) {
+  char buf[220];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  char msg[256];
+  snprintf(msg, sizeof(msg), "{\"type\":\"log\",\"msg\":\"%s\"}", buf);
+  webSocket.broadcastTXT(msg);
+  Serial.println(buf);
+}
+
 void webPushTelemetry() {
   float v, i, pct;
   long xAbs, yAbs;
@@ -2444,19 +2480,27 @@ void webPushTelemetry() {
   bool busy;
   uint8_t pending;
 
+  bool    pathActive;
+  uint8_t wpIdx, wpCnt;
+  bool    dzExp;
+
   portENTER_CRITICAL(&gMux);
-  v     = g_battV;
-  i     = g_battI;
-  pct   = g_battPct;
-  xAbs  = g_xAbs;
-  yAbs  = g_yAbs;
-  cxAbs = g_xCenterTarget;
-  cyAbs = g_yCenterTarget;
-  sp    = (uint8_t)g_speedMode;
-  magOn = g_magnetOn;
-  hallY = g_hallYDetected;
-  hallX = g_hallXDetected;
-  calib = (g_calibState != CALIB_IDLE);
+  v          = g_battV;
+  i          = g_battI;
+  pct        = g_battPct;
+  xAbs       = g_xAbs;
+  yAbs       = g_yAbs;
+  cxAbs      = g_xCenterTarget;
+  cyAbs      = g_yCenterTarget;
+  sp         = (uint8_t)g_speedMode;
+  magOn      = g_magnetOn;
+  hallY      = g_hallYDetected;
+  hallX      = g_hallXDetected;
+  calib      = (g_calibState != CALIB_IDLE);
+  pathActive = g_pathActive;
+  wpIdx      = g_wpIndex;
+  wpCnt      = g_wpCount;
+  dzExp      = g_dzPathYExpanded;
   portEXIT_CRITICAL(&gMux);
 
   // AutoTune state snapshot.
@@ -2527,11 +2571,12 @@ void webPushTelemetry() {
   const char* wifiSSID = s_wifiSSID;
   const char* wifiIP   = s_wifiIP;
 
-  char msg[900];
+  char msg[960];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
            "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,"
            "\"busy\":%s,\"pending\":%u,"
+           "\"path\":%s,\"wpIdx\":%u,\"wpCnt\":%u,\"dzExp\":%s,"
            "\"sysState\":%u,\"tuning\":%s,\"tunePhase\":%u,\"tunePct\":%d,"
            "\"liveTuneSpd\":%.0f,\"liveTuneSpdDiag\":%.0f,\"liveTuneAcc\":%.0f,\"liveTuneDecel\":%.0f,\"liveTuneCurr\":%u,"
            "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u,"
@@ -2544,6 +2589,10 @@ void webPushTelemetry() {
            (calib     ? "true" : "false"),
            (busy      ? "true" : "false"),
            (unsigned)pending,
+           (pathActive ? "true" : "false"),
+           (unsigned)wpIdx,
+           (unsigned)wpCnt,
+           (dzExp     ? "true" : "false"),
            (unsigned)sysState,
            (tuning    ? "true" : "false"),
            (unsigned)tunePh,

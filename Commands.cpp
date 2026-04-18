@@ -10,6 +10,7 @@
 #include "AutoTune.h"
 #include "ChessTestRun.h"
 #include "WiFiNet.h"
+#include "WebUI.h"
 
 enum PendingMoveType : uint8_t {
   PM_SQUARE = 0,
@@ -25,6 +26,7 @@ struct PendingMove {
   uint8_t tr;
   Waypoint wps[MAX_WAYPOINTS];
   uint8_t n;
+  bool dzPathYExpanded;  // re-set g_dzPathYExpanded when this move executes from queue
 };
 
 static const uint8_t PENDING_MOVE_CAP = 8;
@@ -58,6 +60,13 @@ static void executePendingMove(const PendingMove &m) {
   if (m.type == PM_SQUARE_DIRECT) {
     planSquareMoveDirect(m.ff, m.fr, m.tf, m.tr);
     return;
+  }
+  // Re-apply the dead-zone Y expansion in case a previous path cleared it
+  // while this move was waiting in the queue.
+  if (m.dzPathYExpanded) {
+    portENTER_CRITICAL(&gMux);
+    g_dzPathYExpanded = true;
+    portEXIT_CRITICAL(&gMux);
   }
   beginMoveSeq(m.wps, m.n);
 }
@@ -291,6 +300,7 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
 
     PendingMove m = {};
     m.type = PM_PATH;
+    m.dzPathYExpanded = true;
     uint8_t n = 0;
 
     // Parse optional capturer move (capFF/capFR = FROM, capTF/capTR = TO).
@@ -374,8 +384,12 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     m.wps[dzIdx].mag = 0;
 
     enqueueOrExecute(m);
-    Serial.printf("[DZ] deadZoneMove (%d,%d) -> side=%s slot=%d abs=(%ld,%ld) wps=%d\n",
-                  ff, fr, side, slot, dzX, dzY, (int)n);
+    if (hasCapMove)
+      webLog("[DZ] deadZoneMove (%d,%d) side=%s slot=%d dz=(%ld,%ld) wps=%d cap=(%d,%d)->(%d,%d)",
+             ff, fr, side, slot, dzX, dzY, (int)n, capFF_v, capFR_v, capTF_v, capTR_v);
+    else
+      webLog("[DZ] deadZoneMove (%d,%d) side=%s slot=%d dz=(%ld,%ld) wps=%d noCapMove",
+             ff, fr, side, slot, dzX, dzY, (int)n);
     return;
   }
 

@@ -414,6 +414,63 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     return;
   }
 
+  // { "cmd": "deadZoneReturn", "side": "L"|"R", "slot": 0..15, "tf": 0..7, "tr": 1..8 }
+  // Pick up a piece from the dead-zone slot and place it on the given board square.
+  if (strcmp(cmd, "deadZoneReturn") == 0) {
+    const char* side = doc["side"];
+    if (!side || !doc.containsKey("slot") || !doc.containsKey("tf") || !doc.containsKey("tr")) return;
+    uint8_t slot = (uint8_t)(int)doc["slot"];
+    int tf = (int)doc["tf"];
+    int tr = (int)doc["tr"];
+    if (slot > 15 || tf < 0 || tf > 7 || tr < 1 || tr > 8) return;
+
+    long dzX, dzY;
+    deadZoneSlotPos(side[0], slot, dzX, dzY);
+
+    long tX, tY;
+    portENTER_CRITICAL(&gMux);
+    g_dzPathYExpanded = true;
+    portEXIT_CRITICAL(&gMux);
+    squareCenterSteps((uint8_t)tf, (uint8_t)tr, tX, tY);
+
+    PendingMove m = {};
+    m.type            = PM_PATH;
+    m.dzPathYExpanded = true;
+    uint8_t n = 0;
+
+    m.wps[n++] = { dzX, dzY, 1 };  // pick up from dead zone
+
+    // Optional intersection path (dead-zone edge → target square corners).
+    if (doc.containsKey("path")) {
+      JsonArray pathArr = doc["path"].as<JsonArray>();
+      if (!pathArr.isNull()) {
+        for (JsonVariant v : pathArr) {
+          if (n >= MAX_WAYPOINTS - 1) break;
+          if (!v.is<JsonObject>()) continue;
+          JsonObject obj = v.as<JsonObject>();
+          if (!obj.containsKey("u") || !obj.containsKey("v")) continue;
+          float pu = obj["u"].as<float>();
+          float pv = obj["v"].as<float>();
+          long wx, wy;
+          boardUVToXY(pu, pv, wx, wy);
+          long xMin, xMax, yMin, yMax;
+          getXLimits(xMin, xMax); getYLimits(yMin, yMax);
+          wx = clampl(wx, xMin + EDGE_STOP_DIST, xMax - EDGE_STOP_DIST);
+          wy = clampl(wy, yMin + EDGE_STOP_DIST, yMax - EDGE_STOP_DIST);
+          if (wx == m.wps[n-1].x && wy == m.wps[n-1].y) continue;
+          m.wps[n++] = { wx, wy, -1 };
+        }
+      }
+    }
+
+    m.wps[n++] = { tX, tY, 0 };  // drop at target square
+    m.n = n;
+    enqueueOrExecute(m);
+    webLog("[DZ] deadZoneReturn side=%s slot=%u dz=(%ld,%ld) -> f%d r%d (%ld,%ld) wps=%d",
+           side, (unsigned)slot, dzX, dzY, tf, tr, tX, tY, (int)n);
+    return;
+  }
+
   // { "cmd": "gotoDeadZone", "side": "L"|"R", "slot": 0..15 }
   // Move carriage to the stored (or fallback) dead-zone position for that endpoint.
   // Used by calibration UI to show the user where the current position is.
@@ -567,13 +624,25 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
       if (n >= MAX_WAYPOINTS) break;
       if (!v.is<JsonObject>()) continue;
       JsonObject obj = v.as<JsonObject>();
-      if (!obj.containsKey("f") || !obj.containsKey("r")) continue;
-      int f = (int)obj["f"];
-      int r = (int)obj["r"];
-      if (f < 0 || f > 7 || r < 1 || r > 8) continue;
-
       long x, y;
-      squareCenterSteps((uint8_t)f, (uint8_t)r, x, y);
+      if (obj.containsKey("u") && obj.containsKey("v")) {
+        // Intersection-grid waypoint {u,v} (0..8 floats) — routes along square edges.
+        float pu = obj["u"].as<float>();
+        float pv = obj["v"].as<float>();
+        boardUVToXY(pu, pv, x, y);
+        long xMin, xMax, yMin, yMax;
+        getXLimits(xMin, xMax); getYLimits(yMin, yMax);
+        x = clampl(x, xMin + EDGE_STOP_DIST, xMax - EDGE_STOP_DIST);
+        y = clampl(y, yMin + EDGE_STOP_DIST, yMax - EDGE_STOP_DIST);
+      } else if (obj.containsKey("f") && obj.containsKey("r")) {
+        int f = (int)obj["f"];
+        int r = (int)obj["r"];
+        if (f < 0 || f > 7 || r < 1 || r > 8) continue;
+        squareCenterSteps((uint8_t)f, (uint8_t)r, x, y);
+      } else {
+        continue;
+      }
+      if (n > 0 && wps[n-1].x == x && wps[n-1].y == y) continue;
       wps[n++] = { x, y, -1 };
     }
 

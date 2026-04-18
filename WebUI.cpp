@@ -740,6 +740,14 @@ let resetTargetBoard = null;
         };
         while(deadZones.L.length < 16) deadZones.L.push(null);
         while(deadZones.R.length < 16) deadZones.R.push(null);
+        // Normalize old plain-string entries to {pid, homeSq} objects.
+        for(const s of ['L','R']){
+          deadZones[s] = deadZones[s].map(e => {
+            if(!e) return null;
+            if(typeof e === 'string') return {pid: e, homeSq: null};
+            return e;
+          });
+        }
       } else {
         deadZones = { L:new Array(16).fill(null), R:new Array(16).fill(null), nextL:15, nextR:15 };
       }
@@ -1141,13 +1149,13 @@ let selectedPieceId = null;
 function sqKey(f,r){ return String.fromCharCode(97+f) + String(r); }
 function pieceBase(id){ return id ? id.slice(0,2) : null; }
 
-function addToCapturedZone(pid, side){
+function addToCapturedZone(pid, side, homeSq){
   // side: 'L' or 'R'
   if(!pid) return;
   const zone = deadZones[side];
   const key = side === 'L' ? 'nextL' : 'nextR';
   if(deadZones[key] >= 0){
-    zone[deadZones[key]] = pid;
+    zone[deadZones[key]] = {pid, homeSq: homeSq || null};
     deadZones[key]--;
   }
 }
@@ -1163,10 +1171,12 @@ function getCapturedDisplay(side){
   const zone = deadZones[side];
   const captured = [];
   for(let i = 0; i < zone.length; i++){
-    if(zone[i]){
-      const base = pieceBase(zone[i]);
+    const entry = zone[i];
+    if(entry){
+      const pid = entry.pid || entry; // backward compat: entry may be a plain string
+      const base = pieceBase(pid);
       if(pieceSym[base]){
-        captured.push({idx:i, sym:pieceSym[base], pid:zone[i], color:zone[i][0]});
+        captured.push({idx:i, sym:pieceSym[base], pid, color:pid[0]});
       }
     }
   }
@@ -1273,6 +1283,46 @@ function buildPhysicalResetPlan(currentBoard){
   const work = cloneBoard(currentBoard);
   const moves = [];
 
+  // --- Pre-pass: return dead zone pieces to their home squares ---
+  // Iterate slots from 15 (last placed) down to 0 so we unwind the stack in order.
+  for(const side of ['L','R']){
+    for(let slot=15; slot>=0; slot--){
+      const entry = deadZones[side][slot];
+      if(!entry) continue;
+      // Support both new {pid,homeSq} format and old plain-string format.
+      const pid    = (typeof entry === 'object') ? entry.pid    : entry;
+      const homeSq = (typeof entry === 'object') ? entry.homeSq : null;
+      const base = pieceBaseId(pid);
+
+      // Try the recorded home square first; fall back to any matching target square.
+      let destSq = null;
+      if(homeSq && target[homeSq] && pieceBaseId(target[homeSq]) === base && pieceBaseId(work[homeSq]) !== base){
+        destSq = homeSq;
+      }
+      if(!destSq){
+        for(const sq of allSquares()){
+          if(pieceBaseId(target[sq]) !== base) continue;
+          if(pieceBaseId(work[sq]) === base) continue; // already satisfied
+          destSq = sq;
+          break;
+        }
+      }
+      if(!destSq){ console.log("[RESET] DZ " + side + "[" + slot + "]=" + pid + " — no home square available (promoted?)"); continue; }
+
+      // If the destination is occupied, evict that piece to a temp square first.
+      if(work[destSq]){
+        const blocked = {}; blocked[destSq] = true;
+        const tmpSq = findTempSquare(work, target, blocked);
+        if(tmpSq) addPlannedMove(work, moves, destSq, tmpSq);
+      }
+
+      work[destSq] = pid;
+      moves.push({fromSq:"DZ_"+side+"_"+slot, toSq:destSq});
+      console.log("[RESET] DZ " + side + "[" + slot + "]=" + pid + " homeSq=" + homeSq + " -> " + destSq);
+    }
+  }
+
+  // --- Main pass: move board pieces to their target positions ---
   for(const targetSq of allSquares()){
     const wantBase = pieceBaseId(target[targetSq]);
     if(!wantBase) continue;
@@ -1302,27 +1352,183 @@ function buildPhysicalResetPlan(currentBoard){
   return {moves, target};
 }
 
-function dispatchResetMove(fromSq, toSq){
-  const from = sqToXY(fromSq);
-  const to = sqToXY(toSq);
-  const pid = getPieceAt(boardState, from.f, from.r);
-  const path = findShortestPath(boardState, from, to);
+// BFS on the intersection grid (0..8 × 0..8) from the 4 corners of one board
+// square to the 4 corners of another.  Avoids diagonal moves that cross through
+// occupied squares (except source and destination).  Returns an array of {u,v}
+// intersection waypoints NOT including the source/destination square centres —
+// those are sent as {f,r} by the caller.
+function findIntersectionPathBoardToBoard(board, fromF, fromR, toF, toR) {
+  const starts = [
+    {ix: fromF,   iv: fromR-1},
+    {ix: fromF+1, iv: fromR-1},
+    {ix: fromF,   iv: fromR},
+    {ix: fromF+1, iv: fromR},
+  ];
+  const targetCorners = new Set([
+    toF + ',' + (toR-1),
+    (toF+1) + ',' + (toR-1),
+    toF + ',' + toR,
+    (toF+1) + ',' + toR,
+  ]);
 
-  if(path && path.length >= 2 && path.length <= MAX_WP){
-    send({cmd:"pathMove", path});
-  } else {
-    // Prefer planner-based motion when BFS path is not available,
-    // to avoid straight-line drag-through across other pieces.
-    const isKing = pid && pieceType(pid) === "K";
-    const isCastleLike = isKing && (from.f === 4) && (Math.abs(to.f - from.f) === 2) && (from.r === 1 || from.r === 8) && (from.r === to.r);
+  const visited = {};
+  const prev = {};
+  const queue = [];
 
-    if (isCastleLike) {
-      // Avoid castling special-case in squareMove during reset shuffling.
-      send({cmd:"squareMoveDirect", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
-    } else {
-      send({cmd:"squareMove", ff:from.f, fr:from.r, tf:to.f, tr:to.r});
+  for(const s of starts){
+    const k = s.ix + ',' + s.iv;
+    if(!visited[k]){ visited[k]=true; prev[k]=null; queue.push({ix:s.ix,iv:s.iv}); }
+  }
+
+  const dirs = [
+    {dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1},
+    {dx:1,dy:1},{dx:1,dy:-1},{dx:-1,dy:1},{dx:-1,dy:-1}
+  ];
+
+  let goalNode = null;
+  while(queue.length && !goalNode){
+    const cur = queue.shift();
+    const ck = cur.ix + ',' + cur.iv;
+    if(targetCorners.has(ck)){ goalNode = cur; break; }
+
+    for(const d of dirs){
+      const nix = cur.ix + d.dx;
+      const niv = cur.iv + d.dy;
+      if(nix < 0 || nix > 8 || niv < 0 || niv > 8) continue;
+
+      if(Math.abs(d.dx) === 1 && Math.abs(d.dy) === 1){
+        const sqF = d.dx > 0 ? cur.ix : cur.ix - 1;
+        const sqR = d.dy > 0 ? cur.iv + 1 : cur.iv;
+        if(sqF >= 0 && sqF <= 7 && sqR >= 1 && sqR <= 8){
+          if(!(sqF === fromF && sqR === fromR) && !(sqF === toF && sqR === toR) && getPieceAt(board, sqF, sqR)) continue;
+        }
+      }
+
+      const nk = nix + ',' + niv;
+      if(visited[nk]) continue;
+      visited[nk] = true;
+      prev[nk] = ck;
+      queue.push({ix: nix, iv: niv});
     }
   }
+
+  if(!goalNode) return null;
+
+  const path = [];
+  let k = goalNode.ix + ',' + goalNode.iv;
+  while(k !== null && k !== undefined){
+    const parts = k.split(',');
+    path.push({u: parseInt(parts[0],10), v: parseInt(parts[1],10)});
+    k = prev[k];
+  }
+  path.reverse();
+  return path;
+}
+
+// BFS on the intersection grid (0..8 × 0..8) from the dead-zone edge back to
+// the corners of a board square.  Symmetric to findIntersectionPathToDeadZone
+// but starts from the full edge column and navigates inward to the target square.
+function findIntersectionPathFromDeadZone(board, toF, toR, side) {
+  const startIX = (side === 'L') ? 0 : 8;
+
+  const targetCorners = new Set([
+    toF + ',' + (toR-1),
+    (toF+1) + ',' + (toR-1),
+    toF + ',' + toR,
+    (toF+1) + ',' + toR,
+  ]);
+
+  const visited = {};
+  const prev = {};
+  const queue = [];
+
+  for(let iv = 0; iv <= 8; iv++){
+    const k = startIX + ',' + iv;
+    visited[k] = true;
+    prev[k] = null;
+    queue.push({ix: startIX, iv});
+  }
+
+  const dirs = [
+    {dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1},
+    {dx:1,dy:1},{dx:1,dy:-1},{dx:-1,dy:1},{dx:-1,dy:-1}
+  ];
+
+  let goalNode = null;
+
+  while(queue.length && !goalNode){
+    const cur = queue.shift();
+    const ck = cur.ix + ',' + cur.iv;
+    if(targetCorners.has(ck)){ goalNode = cur; break; }
+
+    for(const d of dirs){
+      const nix = cur.ix + d.dx;
+      const niv = cur.iv + d.dy;
+      if(nix < 0 || nix > 8 || niv < 0 || niv > 8) continue;
+
+      if(Math.abs(d.dx) === 1 && Math.abs(d.dy) === 1){
+        const sqF = d.dx > 0 ? cur.ix : cur.ix - 1;
+        const sqR = d.dy > 0 ? cur.iv + 1 : cur.iv;
+        if(sqF >= 0 && sqF <= 7 && sqR >= 1 && sqR <= 8){
+          if(!(sqF === toF && sqR === toR) && getPieceAt(board, sqF, sqR)) continue;
+        }
+      }
+
+      const nk = nix + ',' + niv;
+      if(visited[nk]) continue;
+      visited[nk] = true;
+      prev[nk] = ck;
+      queue.push({ix: nix, iv: niv});
+    }
+  }
+
+  if(!goalNode) return null;
+
+  const path = [];
+  let k = goalNode.ix + ',' + goalNode.iv;
+  while(k !== null && k !== undefined){
+    const parts = k.split(',');
+    path.push({u: parseInt(parts[0],10), v: parseInt(parts[1],10)});
+    k = prev[k];
+  }
+  path.reverse();
+  return path;
+}
+
+function dispatchResetMove(fromSq, toSq){
+  const to = sqToXY(toSq);
+
+  if(fromSq.startsWith("DZ_")){
+    const parts = fromSq.split("_");          // ["DZ","L","15"]
+    const side  = parts[1];
+    const slot  = parseInt(parts[2], 10);
+    const entry = deadZones[side][slot];
+    const pid   = entry ? (typeof entry === 'object' ? entry.pid : entry) : null;
+    const path  = findIntersectionPathFromDeadZone(boardState, to.f, to.r, side);
+    const cmd_dz = {cmd:"deadZoneReturn", side, slot, tf:to.f, tr:to.r};
+    if(path && path.length > 0) cmd_dz.path = path;
+    send(cmd_dz);
+    // Update local state immediately so subsequent plan steps see a consistent board.
+    deadZones[side][slot] = null;
+    if(pid) boardState[toSq] = pid;
+    console.log("[RESET] dispatch DZ_" + side + "_" + slot + " pid=" + pid + " -> " + toSq + " pathLen=" + (path ? path.length : 0));
+    return;
+  }
+
+  const from = sqToXY(fromSq);
+
+  // Use intersection-grid BFS so the magnet travels along square EDGES, never
+  // through piece centres.  The path is built with current boardState so it is
+  // always aware of every piece on the board at dispatch time.
+  const ixPath = findIntersectionPathBoardToBoard(boardState, from.f, from.r, to.f, to.r);
+
+  // Compose the full waypoint list: {f,r} source → {u,v} intersections → {f,r} dest.
+  const wpList = [{f: from.f, r: from.r}];
+  if(ixPath) for(const wp of ixPath) wpList.push(wp);
+  wpList.push({f: to.f, r: to.r});
+
+  send({cmd:"pathMove", path: wpList});
+  console.log("[RESET] board " + fromSq + "->" + toSq + " ixLen=" + (ixPath ? ixPath.length : 0));
 
   applyLocalMove(from.f, from.r, to.f, to.r);
 }
@@ -1360,8 +1566,18 @@ function runPhysicalResetPump(){
 
   while(resetPlanIndex < resetPlan.length){
     const step = resetPlan[resetPlanIndex];
-    const pid = boardState[step.fromSq];
+    let pid;
+    if(step.fromSq.startsWith("DZ_")){
+      const parts = step.fromSq.split("_");
+      const dzSide = parts[1];
+      const dzSlot = parseInt(parts[2], 10);
+      const dzEntry = deadZones[dzSide] ? deadZones[dzSide][dzSlot] : null;
+      pid = dzEntry ? (typeof dzEntry === 'object' ? dzEntry.pid : dzEntry) : null;
+    } else {
+      pid = boardState[step.fromSq];
+    }
     if(!pid){
+      console.log("[RESET] skip " + step.fromSq + " -> " + step.toSq + " (pid absent)");
       resetPlanIndex++;
       continue;
     }
@@ -1388,7 +1604,10 @@ function startPhysicalReset(){
   resetPlanIndex = 0;
   resetTargetBoard = planData.target;
 
+  console.log("[RESET] plan=" + resetPlan.length + " moves: " + resetPlan.map(m=>m.fromSq+"->"+m.toSq).join(", "));
+
   if(resetPlan.length === 0){
+    console.log("[RESET] plan vide — rien à faire");
     finishPhysicalReset(true);
     return;
   }
@@ -1620,7 +1839,7 @@ const pid = boardState[key];
       }
       send(cmd);
     }
-    addToCapturedZone(capturedPid, side);
+    addToCapturedZone(capturedPid, side, xyToSq(f, r));
   }
 
   function executeSelectedMove(){

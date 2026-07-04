@@ -78,15 +78,15 @@ static const uint8_t       AT_LOCKED_MICROSTEPS = 8;
 // Repeatability passes
 static const int AT_REPEAT_QUICK = 1;
 
-// Speed ramp — diagonal tests (steps/s, low → high).
+// Speed ramp — diagonal tests (steps/s candidates).
 // ONE motor runs at √2× carriage speed during 45° moves — the stall-critical case.
 // Diagonals are intentionally kept around half the straight-line speed range.
-static const float    AT_SPEEDS_DIAG[]      = {1800.f, 2500.f, 3200.f, 4000.f, 5000.f, 6000.f, 7000.f};
+static const float    AT_SPEEDS_DIAG[]      = {3000.f, 4500.f, 6500.f, 9000.f, 12000.f, 15000.f, 18000.f};
 static const uint8_t  AT_N_SPEEDS_DIAG      = sizeof(AT_SPEEDS_DIAG)/sizeof(AT_SPEEDS_DIAG[0]);
-// Speed ramp — axis-only tests (steps/s).
+// Speed ramp — axis-only tests (steps/s candidates).
 // Both motors share load more evenly on straight moves, so the carriage can
 // usually run substantially faster than on 45° diagonals at the same current.
-static const float    AT_SPEEDS_AXIS[]      = {4500.f, 6500.f, 8500.f, 10500.f, 12500.f, 14500.f};
+static const float    AT_SPEEDS_AXIS[]      = {9000.f, 13000.f, 17000.f, 21000.f, 25000.f, 30000.f};
 static const uint8_t  AT_N_SPEEDS_AXIS      = sizeof(AT_SPEEDS_AXIS)/sizeof(AT_SPEEDS_AXIS[0]);
 
 // Fixed acceleration used during speed-ramp test sessions (not tuned; hardware ramp constants apply at runtime).
@@ -787,9 +787,9 @@ static FastRefResult fastHomeCornerCheck(long refYMin, long refXMin,
           out.magnitude, out.exceeded ? "FAIL" : "OK");
 
     // ── Return carriage to board centre ──
-    // g_overrideVmax is still set by the caller (session speed); the
-    // return move uses it for full-speed travel back.
-    if (tuneMoveTo(cx, cy) == AR_ABORT) return FR_ABORT;
+    // Use path mode so X+Y move simultaneously at session speed.
+    // Recenter mode is intentionally conservative/sequential.
+    if (tuneMoveToPath(cx, cy) == AR_ABORT) return FR_ABORT;
     vTaskDelay(80 / portTICK_PERIOD_MS);
 
     return FR_OK;
@@ -1144,11 +1144,12 @@ static float computeLevelScore(const SessionStats &s) {
 //
 // A level that sailed through (score → 1.0) gets margin 0.90 —
 // nearly all the headroom is kept.
-// A level that barely cleared the pass threshold gets margin 0.75 —
+// A level with weak-but-still-valid drift performance gets margin 0.75 —
 // a larger haircut to guard against hardware variance day-to-day.
 //
 // Score range [AT_SCORE_PASS_THRESHOLD .. 1.0] maps linearly to
-// [0.75 .. 0.90].
+// [0.75 .. 0.90]. Scores below that still pass if they stayed under the
+// hard drift limit; they just receive the minimum safety margin.
 // ──────────────────────────────────────────────────────────────
 static float graduatedMargin(float score) {
     float t = clampf((score - AT_SCORE_PASS_THRESHOLD) /
@@ -1250,8 +1251,8 @@ static bool runAdaptiveSessionLevel(const char *label,
         }
 
         scoreOut = computeLevelScore(stats);
-        bool hardFail = (stats.timeouts > 0) || (!stats.driftOk) || (stats.driftExceeded > 0);
-        levelOkOut = !hardFail && (scoreOut >= AT_SCORE_PASS_THRESHOLD);
+          bool hardFail = (stats.timeouts > 0) || (!stats.driftOk) || (stats.driftExceeded > 0);
+          levelOkOut = !hardFail;
         atLog("%s @ %u mA: score=%.2f %s (drift=%.1f timeouts=%u refFails=%u)",
               label, (unsigned)mA, scoreOut, levelOkOut ? "PASS" : "FAIL",
               stats.maxDriftTotal, (unsigned)stats.timeouts, (unsigned)stats.driftExceeded);
@@ -1512,16 +1513,15 @@ static float phaseSpeedRampDiag(long refYMin, long refXMin, float baseAccel,
     setPhaseProgress(phase, 0);
     atLog("=== Phase: Diagonal Speed Ramp (%d levels) ===", (int)AT_N_SPEEDS_DIAG);
 
-    float lastGoodSpeed = AT_SPEEDS_DIAG[0];
-    float lastGoodScore = 1.0f;
-    bool  anyPass = false;
+    float selectedSpeed = 0.0f;
+    float selectedScore = 0.0f;
 
-    for (int si = 0; si < (int)AT_N_SPEEDS_DIAG && !g_tuneAbortReq; si++) {
+    for (int si = (int)AT_N_SPEEDS_DIAG - 1; si >= 0 && !g_tuneAbortReq; si--) {
         float speed = AT_SPEEDS_DIAG[si];
         float axisSpeed = axisSpeedForDiagSpeed(speed);
         char label[64];
         snprintf(label, sizeof(label), "Diag speed %d/%d: diag=%.0f axis=%.0f",
-                 si + 1, (int)AT_N_SPEEDS_DIAG, speed, axisSpeed);
+                 (int)AT_N_SPEEDS_DIAG - si, (int)AT_N_SPEEDS_DIAG, speed, axisSpeed);
         atLog("%s", label);
 
         SessionStats s;
@@ -1535,27 +1535,30 @@ static float phaseSpeedRampDiag(long refYMin, long refXMin, float baseAccel,
             return 0.0f;
         }
 
-        if (!levelOk) {
-            if (!anyPass) {
-                atLog("Diag speed ramp: even the lowest diagonal speed could not be validated");
-                return 0.0f;
-            }
-            for (uint8_t c = 0; c < TC_NUM; c++) {
-                if (s.catFails[c]) atLog("  cat %s: tmo=%u", TC_NAMES[c], (unsigned)s.catFails[c]);
-            }
+        if (levelOk) {
+            selectedSpeed = speed;
+            selectedScore = score;
+            setPhaseProgress(phase, 100);
             break;
         }
-        lastGoodSpeed = speed;
-        lastGoodScore = score;
-        anyPass = true;
-        setPhaseProgress(phase, (int)(50.0f * (si + 1) / AT_N_SPEEDS_DIAG));
+
+        for (uint8_t c = 0; c < TC_NUM; c++) {
+            if (s.catFails[c]) atLog("  cat %s: tmo=%u", TC_NAMES[c], (unsigned)s.catFails[c]);
+        }
+        setPhaseProgress(phase,
+                         (int)(100.0f * ((int)AT_N_SPEEDS_DIAG - si) / AT_N_SPEEDS_DIAG));
     }
 
-    float margin = graduatedMargin(lastGoodScore);
-    float result = lastGoodSpeed * margin;
+    if (selectedSpeed <= 0.0f) {
+        atLog("Diag speed ramp: no diagonal speed level could be validated");
+        return 0.0f;
+    }
+
+    float margin = graduatedMargin(selectedScore);
+    float result = selectedSpeed * margin;
     if (result < 3000.0f) result = 3000.0f;
-    atLog("Diag speed done: lastGood=%.0f score=%.2f margin=%.2f safe=%.0f",
-          lastGoodSpeed, lastGoodScore, margin, result);
+    atLog("Diag speed done: selected=%.0f score=%.2f margin=%.2f safe=%.0f",
+          selectedSpeed, selectedScore, margin, result);
     return result;
 }
 
@@ -1582,15 +1585,16 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
         return diagSafeSpeed;  // already as fast as axis allows at this range
     }
 
-    float lastGoodSpeed = diagSafeSpeed;
-    float lastGoodScore = 1.0f;
-    int   numTested     = (int)AT_N_SPEEDS_AXIS - startIdx;
+    float selectedSpeed = diagSafeSpeed;
+    float selectedScore = 1.0f;
+    bool  foundPass = false;
+    int   numTested = (int)AT_N_SPEEDS_AXIS - startIdx;
 
-    for (int si = startIdx; si < (int)AT_N_SPEEDS_AXIS && !g_tuneAbortReq; si++) {
+    for (int si = (int)AT_N_SPEEDS_AXIS - 1; si >= startIdx && !g_tuneAbortReq; si--) {
         float speed = AT_SPEEDS_AXIS[si];
         char label[64];
         snprintf(label, sizeof(label), "Axis speed %d/%d: %.0f steps/s",
-                 si - startIdx + 1, numTested, speed);
+                 (int)AT_N_SPEEDS_AXIS - si, numTested, speed);
         atLog("%s", label);
 
         SessionStats s;
@@ -1604,23 +1608,34 @@ static float phaseSpeedRampAxis(long refYMin, long refXMin,
             return diagSafeSpeed;
         }
 
-        if (!levelOk) {
+        if (levelOk) {
+            selectedSpeed = speed;
+            selectedScore = score;
+            foundPass = true;
+            setPhaseProgress(phase, 100);
             for (uint8_t c = 0; c < TC_NUM; c++) {
                 if (s.catFails[c]) atLog("  cat %s: tmo=%u", TC_NAMES[c], (unsigned)s.catFails[c]);
             }
             break;
         }
-        lastGoodSpeed = speed;
-        lastGoodScore = score;
+        for (uint8_t c = 0; c < TC_NUM; c++) {
+            if (s.catFails[c]) atLog("  cat %s: tmo=%u", TC_NAMES[c], (unsigned)s.catFails[c]);
+        }
         setPhaseProgress(phase,
-                          50 + (int)(50.0f * (si - startIdx + 1) / numTested));
+                         (int)(100.0f * ((int)AT_N_SPEEDS_AXIS - si) / numTested));
     }
 
-    float margin = axisGraduatedMargin(lastGoodScore);
-    float result = lastGoodSpeed * margin;
+    if (!foundPass) {
+        atLog("Axis ramp: no level above diagonal safe speed validated; keeping axis=diag=%.0f", diagSafeSpeed);
+        setPhaseProgress(phase, 100);
+        return diagSafeSpeed;
+    }
+
+    float margin = axisGraduatedMargin(selectedScore);
+    float result = selectedSpeed * margin;
     if (result < diagSafeSpeed) result = diagSafeSpeed;  // never go below diagonal safe
-    atLog("Axis speed done: lastGood=%.0f score=%.2f margin=%.2f safe=%.0f",
-          lastGoodSpeed, lastGoodScore, margin, result);
+    atLog("Axis speed done: selected=%.0f score=%.2f margin=%.2f safe=%.0f",
+          selectedSpeed, selectedScore, margin, result);
     setPhaseProgress(phase, 100);
     return result;
 }
@@ -1641,8 +1656,8 @@ static uint16_t phaseCurrentTune(long &refYMin, long &refXMin,
     const uint16_t adaptiveCurrent = currentForIndex(startCurrentIdx);
     setPhaseProgress(AT_PHASE_CURRENT, 0);
     atLog("=== Phase: Current Validation (fast) ===");
-    atLog("Current params: axisSpeed=%.0f diagSpeed=%.0f accel=%.0f decel=%.0f score>=%.2f",
-          safeSpeedAxis, safeSpeedDiag, safeAccel, safeDecel, AT_SCORE_PASS_THRESHOLD);
+        atLog("Current params: axisSpeed=%.0f diagSpeed=%.0f accel=%.0f decel=%.0f (score used for margin only)",
+            safeSpeedAxis, safeSpeedDiag, safeAccel, safeDecel);
     atLog("Validating adaptive current first: %u mA", (unsigned)adaptiveCurrent);
 
     uint16_t bestCurrent = adaptiveCurrent;
@@ -1663,8 +1678,8 @@ static uint16_t phaseCurrentTune(long &refYMin, long &refXMin,
         }
 
         score = computeLevelScore(s);
-        bool hardFail = (s.timeouts > 0) || (!s.driftOk) || (s.driftExceeded > 0);
-        bool  levelOk = !hardFail && (score >= AT_SCORE_PASS_THRESHOLD);
+          bool hardFail = (s.timeouts > 0) || (!s.driftOk) || (s.driftExceeded > 0);
+          bool  levelOk = !hardFail;
         atLog("Current %u mA: score=%.2f %s (drift=%.1f Y:%.1f X:%.1f refFails=%u timeouts=%u)",
               (unsigned)mA, score, levelOk ? "PASS" : "FAIL",
               s.maxDriftTotal, s.maxDriftY, s.maxDriftX,
@@ -1747,9 +1762,8 @@ static bool phaseFinalCharacterize(long &refYMin, long &refXMin,
     atLog("  Max drift:   %.1f steps (Y:%.1f X:%.1f)  %s",
           s.maxDriftTotal, s.maxDriftY, s.maxDriftX, s.driftOk ? "PASS" : "WARN");
     float score = computeLevelScore(s);
-    bool finalOk = (s.timeouts == 0) && s.driftOk && (s.driftExceeded == 0) &&
-                   (score >= AT_SCORE_PASS_THRESHOLD);
-    atLog("  Session score: %.2f (threshold %.2f)", score, AT_SCORE_PASS_THRESHOLD);
+    bool finalOk = (s.timeouts == 0) && s.driftOk && (s.driftExceeded == 0);
+    atLog("  Session score: %.2f (margin metric)", score);
     for (uint8_t c = 0; c < TC_NUM; c++) {
         atLog("  %s failures: %u", TC_NAMES[c], (unsigned)s.catFails[c]);
     }

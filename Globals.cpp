@@ -6,6 +6,11 @@ portMUX_TYPE gMux = portMUX_INITIALIZER_UNLOCKED;
 // Hall
 volatile bool g_hallYDetected = false;
 volatile bool g_hallXDetected = false;
+volatile bool g_liveLimitFault = false;
+volatile char g_liveLimitAxis = 0;
+volatile int8_t g_liveLimitDir = 0;
+volatile bool g_tuneRefSeekActive = false;
+volatile char g_tuneRefSeekAxis = 0;
 
 int lastHallYState = HIGH;
 int lastHallXState = HIGH;
@@ -13,6 +18,8 @@ unsigned long lastHallPollMs = 0;
 
 // Calib
 volatile CalibState g_calibState = CALIB_IDLE;
+volatile float g_calibYSpeed = CALIB_Y_SPEED;
+volatile float g_calibXSpeed = CALIB_X_SPEED;
 
 volatile bool g_yLimitsCalibrated = false;
 volatile bool g_xLimitsCalibrated = false;
@@ -127,6 +134,7 @@ volatile bool      g_tuneAbortReq = false;
 TuneSettings g_tuneSettings = {
     /* safeSpeed     */ 8600.0f,
     /* safeSpeedDiag */ 6000.0f,
+    /* calibSpeed    */ 1200.0f,
     /* safeAccel     */ 6000.0f,
     /* safeDecel     */ 6000.0f,
     /* motorCurrent  */ 850,
@@ -138,6 +146,7 @@ volatile float g_overrideVmax     = 0.0f;
 volatile float g_overrideDiagVmax = 0.0f;
 volatile float g_overrideAccel    = 0.0f;
 volatile float g_overrideDecel    = 0.0f;
+volatile float g_pathSpeedScale   = 1.0f;
 volatile uint16_t g_tuneCurrentMa = 0;
 volatile float g_tuneLiveAxisSpeed = 0.0f;
 volatile float g_tuneLiveDiagSpeed = 0.0f;
@@ -168,6 +177,11 @@ void initGlobals() {
 
   g_hallYDetected = false;
   g_hallXDetected = false;
+  g_liveLimitFault = false;
+  g_liveLimitAxis = 0;
+  g_liveLimitDir = 0;
+  g_tuneRefSeekActive = false;
+  g_tuneRefSeekAxis = 0;
 
   g_yLimitsCalibrated = false;
   g_xLimitsCalibrated = false;
@@ -177,6 +191,8 @@ void initGlobals() {
   g_xHallPos = 0;
 
   g_calibState = CALIB_IDLE;
+  g_calibYSpeed = CALIB_Y_SPEED;
+  g_calibXSpeed = CALIB_X_SPEED;
   g_recenter = false;
 
   g_pathActive = false;
@@ -186,6 +202,7 @@ void initGlobals() {
   g_pathTargetY = XY_ORIGIN_Y;
 
   g_autoMagnetPath = false;
+  g_pathSpeedScale = 1.0f;
 
   g_autoCalibRequested = true;
   g_autoCalibStarted = false;

@@ -45,6 +45,7 @@ enum DriverCurrentProfile : uint8_t {
 };
 
 static bool g_tmcReady = false;
+static bool g_spreadCycleEnabled = false;
 static DriverCurrentProfile g_profile = PROFILE_CRUISE;
 static uint8_t g_microsteps = TMC_MICROSTEPS_COARSE;
 static bool g_motionProfileLocked = false;
@@ -93,19 +94,32 @@ static void applyProfile(DriverCurrentProfile profile) {
   Serial.printf("[TMC-UART] Current profile: %s (%u mA, hold %u%%)\n", name, runCurrent, holdPct);
 }
 
+void setDriversSpreadCycle(bool enabled) {
+  g_spreadCycleEnabled = enabled;
+  if (!g_tmcReady) return;
+
+  leftDriver.en_spreadCycle(enabled);
+  rightDriver.en_spreadCycle(enabled);
+  Serial.printf("[TMC-UART] Chopper mode: %s\n", enabled ? "SpreadCycle" : "StealthChop");
+}
+
+bool getDriversSpreadCycle() {
+  return g_spreadCycleEnabled;
+}
+
 void initDriversUART() {
   TMCSerial.begin(TMC_UART_BAUD, SERIAL_8N1, TMC_UART_RX_PIN, TMC_UART_TX_PIN);
   delay(20);
 
   leftDriver.begin();
   leftDriver.toff(4);
-  leftDriver.en_spreadCycle(false);   // StealthChop2 (smooth, quiet)
+  leftDriver.en_spreadCycle(g_spreadCycleEnabled);
   leftDriver.pwm_autoscale(true);     // automatic amplitude adaptation
   leftDriver.pwm_autograd(true);      // automatic gradient adaptation — smoother torque at low speed
 
   rightDriver.begin();
   rightDriver.toff(4);
-  rightDriver.en_spreadCycle(false);
+  rightDriver.en_spreadCycle(g_spreadCycleEnabled);
   rightDriver.pwm_autoscale(true);
   rightDriver.pwm_autograd(true);
 

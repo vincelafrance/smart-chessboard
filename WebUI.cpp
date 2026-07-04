@@ -582,7 +582,12 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
   connect();  // hoisted — starts WebSocket before any optional element bindings can throw
 
   function send(obj){
-    if(!ws || ws.readyState !== WebSocket.OPEN) return;
+    if(!ws || ws.readyState !== WebSocket.OPEN) {
+      const cmd = obj && obj.cmd ? obj.cmd : "";
+      if(cmd && cmd !== "move") setStatus("WebSocket non connecté — commande non envoyée", false);
+      console.warn("[SC] send dropped, websocket not open", obj);
+      return false;
+    }
     // If the user moves the carriage with arrows while a corner is selected,
     // mark the position as modified (dirty).
     const calibHasTarget = calibCornerMode && calibStep && calibStep !== "advanced";
@@ -593,6 +598,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
       renderBoard();
     }
     ws.send(JSON.stringify(obj));
+    return true;
   }
   function setActive(btn){
     [bSlow,bNorm,bFast].forEach(b=>b.classList.remove("active"));
@@ -1269,9 +1275,25 @@ function findTempSquare(work, target, blocked){
   return null;
 }
 
+function evictDestinationIfNeeded(work, target, moves, destSq, extraBlocked){
+  if(!work[destSq]) return true;
+  const blocked = Object.assign({}, extraBlocked || {});
+  blocked[destSq] = true;
+  const tmpSq = findTempSquare(work, target, blocked);
+  if(!tmpSq) {
+    console.log("[RESET] impossible de libérer " + destSq + " — aucune case temporaire disponible");
+    return false;
+  }
+  return addPlannedMove(work, moves, destSq, tmpSq);
+}
+
 function addPlannedMove(work, moves, fromSq, toSq){
   const pid = work[fromSq];
   if(!pid) return false;
+  if(work[toSq]) {
+    console.log("[RESET] refused planned move " + fromSq + " -> " + toSq + " (destination occupée)");
+    return false;
+  }
   delete work[fromSq];
   work[toSq] = pid;
   moves.push({fromSq, toSq});
@@ -1309,12 +1331,9 @@ function buildPhysicalResetPlan(currentBoard){
       }
       if(!destSq){ console.log("[RESET] DZ " + side + "[" + slot + "]=" + pid + " — no home square available (promoted?)"); continue; }
 
-      // If the destination is occupied, evict that piece to a temp square first.
-      if(work[destSq]){
-        const blocked = {}; blocked[destSq] = true;
-        const tmpSq = findTempSquare(work, target, blocked);
-        if(tmpSq) addPlannedMove(work, moves, destSq, tmpSq);
-      }
+      // If the destination is occupied, evict that piece first. Never plan a
+      // dead-zone return onto an occupied square.
+      if(!evictDestinationIfNeeded(work, target, moves, destSq)) continue;
 
       work[destSq] = pid;
       moves.push({fromSq:"DZ_"+side+"_"+slot, toSq:destSq});
@@ -1337,14 +1356,9 @@ function buildPhysicalResetPlan(currentBoard){
     // cannot be restored).  Leave it in place and skip this target square.
     if(target[srcSq] && pieceBaseId(target[srcSq]) === wantBase) continue;
 
-    if(work[targetSq]) {
-      const blocked = {};
-      blocked[targetSq] = true;
-      blocked[srcSq] = true;
-      const tmpSq = findTempSquare(work, target, blocked);
-      if(!tmpSq) continue;
-      addPlannedMove(work, moves, targetSq, tmpSq);
-    }
+    const blocked = {};
+    blocked[srcSq] = true;
+    if(!evictDestinationIfNeeded(work, target, moves, targetSq, blocked)) continue;
 
     addPlannedMove(work, moves, srcSq, targetSq);
   }
@@ -1504,18 +1518,27 @@ function dispatchResetMove(fromSq, toSq){
     const slot  = parseInt(parts[2], 10);
     const entry = deadZones[side][slot];
     const pid   = entry ? (typeof entry === 'object' ? entry.pid : entry) : null;
+    if(boardState[toSq]){
+      console.log("[RESET] abort DZ_" + side + "_" + slot + " -> " + toSq + " (destination occupée par " + boardState[toSq] + ")");
+      return false;
+    }
     const path  = findIntersectionPathFromDeadZone(boardState, to.f, to.r, side);
     const cmd_dz = {cmd:"deadZoneReturn", side, slot, tf:to.f, tr:to.r};
     if(path && path.length > 0) cmd_dz.path = path;
     send(cmd_dz);
     // Update local state immediately so subsequent plan steps see a consistent board.
     deadZones[side][slot] = null;
+    recomputeDeadZonePointers();
     if(pid) boardState[toSq] = pid;
     console.log("[RESET] dispatch DZ_" + side + "_" + slot + " pid=" + pid + " -> " + toSq + " pathLen=" + (path ? path.length : 0));
-    return;
+    return true;
   }
 
   const from = sqToXY(fromSq);
+  if(boardState[toSq]){
+    console.log("[RESET] abort " + fromSq + " -> " + toSq + " (destination occupée par " + boardState[toSq] + ")");
+    return false;
+  }
 
   // Use intersection-grid BFS so the magnet travels along square EDGES, never
   // through piece centres.  The path is built with current boardState so it is
@@ -1531,6 +1554,7 @@ function dispatchResetMove(fromSq, toSq){
   console.log("[RESET] board " + fromSq + "->" + toSq + " ixLen=" + (ixPath ? ixPath.length : 0));
 
   applyLocalMove(from.f, from.r, to.f, to.r);
+  return true;
 }
 
 function finishPhysicalReset(ok){
@@ -1582,7 +1606,10 @@ function runPhysicalResetPump(){
       continue;
     }
 
-    dispatchResetMove(step.fromSq, step.toSq);
+    if(!dispatchResetMove(step.fromSq, step.toSq)){
+      finishPhysicalReset(false);
+      return;
+    }
     resetPlanIndex++;
     setStatus("Reset physique: " + resetPlanIndex + "/" + resetPlan.length, true);
     saveUiState();
@@ -2111,6 +2138,8 @@ const pid = boardState[key];
     stopHold();
     if(tuneBusy){ return; }
     tuneLogEl.textContent = "";
+    appendTuneLog("Start request sent...");
+    setStatus("Auto Tune demandé", true);
     send({cmd:"start_tuning"});
   });
 
@@ -2760,6 +2789,7 @@ void webPushTelemetry() {
   bool     tuneValid    = tuneSnapshot.tuningValid;
   float    tuneSpd      = tuneSnapshot.safeSpeed;
   float    tuneSpdDiag  = tuneSnapshot.safeSpeedDiag;
+  float    tuneCalibSpd = tuneSnapshot.calibSpeed;
   float    tuneAcc      = tuneSnapshot.safeAccel;
   float    tuneDecel    = tuneSnapshot.safeDecel;
   uint16_t tuneCurr     = tuneSnapshot.motorCurrent;
@@ -2790,7 +2820,7 @@ void webPushTelemetry() {
   const char* wifiSSID = s_wifiSSID;
   const char* wifiIP   = s_wifiIP;
 
-  char msg[960];
+  char msg[1024];
   snprintf(msg, sizeof(msg),
            "{\"pct\":%.2f,\"v\":%.3f,\"i\":%.3f,\"x\":%ld,\"y\":%ld,\"sp\":%u,"
            "\"mag\":%s,\"hallY\":%s,\"hallX\":%s,\"calib\":%s,"
@@ -2798,7 +2828,7 @@ void webPushTelemetry() {
            "\"path\":%s,\"wpIdx\":%u,\"wpCnt\":%u,\"dzExp\":%s,"
            "\"sysState\":%u,\"tuning\":%s,\"tunePhase\":%u,\"tunePct\":%d,"
            "\"liveTuneSpd\":%.0f,\"liveTuneSpdDiag\":%.0f,\"liveTuneAcc\":%.0f,\"liveTuneDecel\":%.0f,\"liveTuneCurr\":%u,"
-           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u,"
+           "\"tuneValid\":%s,\"tuneSpd\":%.0f,\"tuneSpdDiag\":%.0f,\"tuneCalibSpd\":%.0f,\"tuneAcc\":%.0f,\"tuneDecel\":%.0f,\"tuneCurr\":%u,"
            "\"testRun\":%s,\"trStep\":\"%s\",\"trIdx\":%u,\"trTotal\":%u,"
            "\"wifiSTA\":%s,\"wifiSSID\":\"%s\",\"wifiIP\":\"%s\"}",
            pct, v, i, xDisp, yDisp, (unsigned)sp,
@@ -2818,7 +2848,7 @@ void webPushTelemetry() {
            tunePct,
            liveTuneSpd, liveTuneSpdDiag, liveTuneAcc, liveTuneDecel, (unsigned)liveTuneCurr,
            (tuneValid ? "true" : "false"),
-           tuneSpd, tuneSpdDiag, tuneAcc, tuneDecel,
+           tuneSpd, tuneSpdDiag, tuneCalibSpd, tuneAcc, tuneDecel,
            (unsigned)tuneCurr,
            (testRunActive ? "true" : "false"),
            trStepSnap,

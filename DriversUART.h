@@ -7,6 +7,8 @@ void serviceDriversUART(float vA_steps_s, float vB_steps_s, bool wantsMove, bool
 uint8_t getDriversUARTMicrosteps();
 void setMotionProfileLock(bool enabled, uint8_t microsteps, uint16_t moveCurrentMa);
 bool isMotionProfileLocked();
+void setDriversSpreadCycle(bool enabled);
+bool getDriversSpreadCycle();
 
 // Runtime current override support
 void setCurrentOverrides(uint16_t cruiseMa, uint16_t fastMa);

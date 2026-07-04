@@ -31,6 +31,11 @@ void startFullCalibration() {
   g_recenter = false;
   g_vx_xy = 0;
   g_vy_xy = 0;
+  g_liveLimitFault = false;
+  g_liveLimitAxis = 0;
+  g_liveLimitDir = 0;
+  g_tuneRefSeekActive = false;
+  g_tuneRefSeekAxis = 0;
   g_calibState = CALIB_Y_BOTTOM;
   g_lastCmdMs = now;
   portEXIT_CRITICAL(&gMux);
@@ -51,6 +56,11 @@ void startCalibrationFromKnownCorner(long yKnown, long xKnown, bool knownIsBotto
   g_recenter = false;
   g_vx_xy    = 0;
   g_vy_xy    = 0;
+  g_liveLimitFault = false;
+  g_liveLimitAxis = 0;
+  g_liveLimitDir = 0;
+  g_tuneRefSeekActive = false;
+  g_tuneRefSeekAxis = 0;
   portEXIT_CRITICAL(&gMux);
 
   s_yBottom = s_xBottom = s_yTop = s_xTop = 0;
@@ -104,6 +114,11 @@ void startCalibrationFromKnownHall(bool hasY, long yKnown,
   g_recenter = false;
   g_vx_xy    = 0;
   g_vy_xy    = 0;
+  g_liveLimitFault = false;
+  g_liveLimitAxis = 0;
+  g_liveLimitDir = 0;
+  g_tuneRefSeekActive = false;
+  g_tuneRefSeekAxis = 0;
   portEXIT_CRITICAL(&gMux);
 
   s_yBottom = s_xBottom = s_yTop = s_xTop = 0;

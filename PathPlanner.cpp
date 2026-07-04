@@ -128,17 +128,32 @@ void beginMoveSeq(const Waypoint *wps, uint8_t n) {
   if (!wps || n == 0) return;
   if (n > MAX_WAYPOINTS) n = MAX_WAYPOINTS;
 
-  // Select the per-group current profile before the first step, based on the
-  // overall move vector (start -> final waypoint).  Done outside the critical
-  // section because selectCurrentsForMove only reads shared position under
-  // its own brief lock.
+  // Select current and speed profile before the first step, based on the
+  // overall move vector (start -> final waypoint).
+  float moveSpeedScale = 1.0f;
   {
     long fromX, fromY;
     portENTER_CRITICAL(&gMux);
     fromX = g_xAbs;
     fromY = g_yAbs;
     portEXIT_CRITICAL(&gMux);
+    const long dx = labs(wps[n - 1].x - fromX);
+    const long dy = labs(wps[n - 1].y - fromY);
+    const long maxD = (dx > dy) ? dx : dy;
+    const long minD = (dx < dy) ? dx : dy;
+    const float diagRatio = (maxD > 0) ? (float)minD / (float)maxD : 0.0f;
+
     selectCurrentsForMove(fromX, fromY, wps[n - 1].x, wps[n - 1].y);
+
+    if (maxD < 900L) {
+      moveSpeedScale = 0.68f;
+    } else if (n >= 4) {
+      moveSpeedScale = 0.82f;
+    } else if (diagRatio >= 0.30f) {
+      moveSpeedScale = 0.90f;
+    } else {
+      moveSpeedScale = 1.0f;
+    }
   }
 
   portENTER_CRITICAL(&gMux);
@@ -153,6 +168,7 @@ void beginMoveSeq(const Waypoint *wps, uint8_t n) {
 
   g_pathTargetX = g_waypoints[0].x;
   g_pathTargetY = g_waypoints[0].y;
+  g_pathSpeedScale = moveSpeedScale;
 
   g_autoMagnetPath = true;
   g_lastCmdMs = millis();
@@ -160,8 +176,7 @@ void beginMoveSeq(const Waypoint *wps, uint8_t n) {
 
   magnetSet(false);
 
-  Serial.print("[PATH] begin seq, n=");
-  Serial.println(n);
+  Serial.printf("[PATH] begin seq, n=%u speedScale=%.2f\n", (unsigned)n, moveSpeedScale);
 }
 
 void abortPath() {
@@ -170,6 +185,7 @@ void abortPath() {
   g_wpCount = 0;
   g_wpIndex = 0;
   g_autoMagnetPath = false;
+  g_pathSpeedScale = 1.0f;
   g_dzPathYExpanded = false;  // abort clears the dead-zone path limit expansion
   portEXIT_CRITICAL(&gMux);
 }

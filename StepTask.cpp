@@ -8,6 +8,44 @@
 
 static TaskHandle_t stepTaskHandle = nullptr;
 
+static const float LIVE_LIMIT_MIN_VXY = 25.0f;
+static const unsigned long LIVE_LIMIT_LOG_MS = 350UL;
+
+static void handleLiveLimitHit(char axis, int8_t dir, long xAbs, long yAbs) {
+  static unsigned long s_lastLogMs = 0;
+
+  unsigned long nowMs = millis();
+
+  portENTER_CRITICAL(&gMux);
+  if (axis == 'X') {
+    g_xHallPos = xAbs;
+  } else {
+    g_yHallPos = yAbs;
+  }
+
+  g_liveLimitFault = true;
+  g_liveLimitAxis  = axis;
+  g_liveLimitDir   = dir;
+
+  g_recenter       = false;
+  g_pathActive     = false;
+  g_wpCount        = 0;
+  g_wpIndex        = 0;
+  g_autoMagnetPath = false;
+  g_pathSpeedScale = 1.0f;
+  g_dzPathYExpanded = false;
+  g_vx_xy          = 0.0f;
+  g_vy_xy          = 0.0f;
+  g_lastCmdMs      = nowMs;
+  portEXIT_CRITICAL(&gMux);
+
+  if (nowMs - s_lastLogMs >= LIVE_LIMIT_LOG_MS) {
+    s_lastLogMs = nowMs;
+    Serial.printf("[LIMIT] Live %c-%s Hall hit at x=%ld y=%ld; motion aborted\n",
+                  axis, dir < 0 ? "MIN" : "MAX", xAbs, yAbs);
+  }
+}
+
 static void stepTask(void *param) {
   (void)param;
 
@@ -47,6 +85,9 @@ static void stepTask(void *param) {
     CalibState calibState;
     float vx, vy;
     float overrideAccel;
+    float calibYSpeed;
+    float calibXSpeed;
+    float pathSpeedScale;
     bool recenter;
     bool pathActive;
     long pathTx, pathTy;
@@ -57,6 +98,9 @@ static void stepTask(void *param) {
     vx            = g_vx_xy;
     vy            = g_vy_xy;
     overrideAccel = g_overrideAccel;
+    calibYSpeed   = g_calibYSpeed;
+    calibXSpeed   = g_calibXSpeed;
+    pathSpeedScale= g_pathSpeedScale;
     recenter      = g_recenter;
     pathActive    = g_pathActive;
     pathTx        = g_pathTargetX;
@@ -121,7 +165,7 @@ static void stepTask(void *param) {
     if (calibY) {
       vx_t = 0.0f;
       float dirY = (calibState == CALIB_Y_TOP) ? -(float)CALIB_Y_DIR : (float)CALIB_Y_DIR;
-      vy_t = dirY * CALIB_Y_SPEED;
+      vy_t = dirY * calibYSpeed;
       settleStartMs = 0;
     }
     else if (calibX) {
@@ -129,8 +173,8 @@ static void stepTask(void *param) {
       long ex = xTarget - xAbs;
       long exAbs = labs(ex);
       float dirX = (calibState == CALIB_X_TOP) ? -(float)CALIB_X_DIR : (float)CALIB_X_DIR;
-      float vCapX = fmaxf(180.0f, CALIB_X_SPEED * 1.0f);
-      float minVX = CALIB_X_SPEED * 0.5f;
+      float vCapX = fmaxf(180.0f, calibXSpeed * 1.0f);
+      float minVX = calibXSpeed * 0.5f;
 
       if (exAbs < 120) {
         float t = clampf((float)exAbs / 120.0f, 0.0f, 1.0f);
@@ -139,7 +183,7 @@ static void stepTask(void *param) {
         vCapX = fmaxf(100.0f, vCapX * (0.45f + 0.55f * t));
       }
 
-      vx_t = clampf(dirX * CALIB_X_SPEED, -vCapX, +vCapX);
+      vx_t = clampf(dirX * calibXSpeed, -vCapX, +vCapX);
       if (fabs(vx_t) > 0.0f && fabs(vx_t) < minVX && exAbs > 2 * RECENTER_DEADBAND_XY) {
         vx_t = (vx_t > 0) ? minVX : -minVX;
       }
@@ -191,6 +235,7 @@ static void stepTask(void *param) {
           pathVmax = g_overrideVmax + diagFrac * (g_overrideDiagVmax - g_overrideVmax);
         }
       }
+      pathVmax *= clampf(pathSpeedScale, 0.45f, 1.05f);
       float pathMinV = PATH_MIN_VXY;
       float vCap = pathVmax;
 
@@ -253,6 +298,7 @@ static void stepTask(void *param) {
             g_pathActive = false;
             g_wpCount    = 0;
             g_wpIndex    = 0;
+            g_pathSpeedScale = 1.0f;
             g_dzPathYExpanded = false;
             flyDone = true;
           } else {
@@ -336,6 +382,7 @@ static void stepTask(void *param) {
           g_pathActive = false;
           g_wpCount    = 0;
           g_wpIndex    = 0;
+          g_pathSpeedScale = 1.0f;
           g_dzPathYExpanded = false;
           settleDone = true;
         } else {
@@ -422,11 +469,113 @@ static void stepTask(void *param) {
     }
 
     // -----------------------------------------------------------------------
+    // Calibration Hall brake.
+    //
+    // Calibration deliberately drives until a Hall edge is found, but the
+    // velocity task runs faster than calibrationLoop().  As soon as a new Hall
+    // hit appears, stop that seek axis immediately; calibrationLoop will record
+    // the edge and advance the state on its next poll.  If the input was
+    // already LOW, keep moving so the carriage can leave the old Hall zone.
+    // -----------------------------------------------------------------------
+    if (calibY && lastHallYState == HIGH && digitalRead(HALL_Y_PIN) == LOW) {
+      vy_t = 0.0f;
+    }
+    if (calibX && lastHallXState == HIGH && digitalRead(HALL_X_PIN) == LOW) {
+      vx_t = 0.0f;
+    }
+
+    // -----------------------------------------------------------------------
+    // Live Hall edge guard.
+    //
+    // The two logical Hall inputs are shared by opposite corners.  During
+    // normal motion we infer the concrete edge from commanded direction:
+    //   X Hall + -X motion => X min, X Hall + +X motion => X max
+    //   Y Hall + -Y motion => Y min, Y Hall + +Y motion => Y max
+    // Calibration states are excluded because Hall hits are expected there.
+    // -----------------------------------------------------------------------
+    static int s_prevLiveHallX = HIGH;
+    static int s_prevLiveHallY = HIGH;
+    const int liveHallX = digitalRead(HALL_X_PIN);
+    const int liveHallY = digitalRead(HALL_Y_PIN);
+    bool hardStopNow = false;
+    long xMid = xMin + (xMax - xMin) / 2L;
+    long yMid = yMin + (yMax - yMin) / 2L;
+
+    const bool escapingXMin = (liveHallX == LOW && xAbs <= xMid && vx_t > LIVE_LIMIT_MIN_VXY);
+    const bool escapingXMax = (liveHallX == LOW && xAbs >= xMid && vx_t < -LIVE_LIMIT_MIN_VXY);
+    const bool escapingYMin = (liveHallY == LOW && yAbs <= yMid && vy_t > LIVE_LIMIT_MIN_VXY);
+    const bool escapingYMax = (liveHallY == LOW && yAbs >= yMid && vy_t < -LIVE_LIMIT_MIN_VXY);
+
+    if (g_tuneActive && !calibY && !calibX && (pathActive || recenter)) {
+      const bool newXHit = (s_prevLiveHallX == HIGH && liveHallX == LOW);
+      const bool newYHit = (s_prevLiveHallY == HIGH && liveHallY == LOW);
+      const bool badXHit = newXHit && !(escapingXMin || escapingXMax);
+      const bool badYHit = newYHit && !(escapingYMin || escapingYMax);
+      if (badXHit || badYHit) {
+        if (badXHit) handleLiveLimitHit('X', vx_t < 0.0f ? -1 : +1, xAbs, yAbs);
+        if (badYHit) handleLiveLimitHit('Y', vy_t < 0.0f ? -1 : +1, xAbs, yAbs);
+        vx_t = 0.0f;
+        vy_t = 0.0f;
+        hardStopNow = true;
+      }
+    }
+
+    if (!calibY && !calibX) {
+      bool hitXMin = false, hitXMax = false, hitYMin = false, hitYMax = false;
+      const bool hallXLow = (liveHallX == LOW);
+      const bool hallYLow = (liveHallY == LOW);
+
+      if (hallXLow) {
+        if (vx_t < -LIVE_LIMIT_MIN_VXY && xAbs <= xMid) hitXMin = true;
+        else if (vx_t > LIVE_LIMIT_MIN_VXY && xAbs >= xMid) hitXMax = true;
+      }
+      if (hallYLow) {
+        if (vy_t < -LIVE_LIMIT_MIN_VXY && yAbs <= yMid) hitYMin = true;
+        else if (vy_t > LIVE_LIMIT_MIN_VXY && yAbs >= yMid) hitYMax = true;
+      }
+
+      if (escapingXMin) hitXMin = false;
+      if (escapingXMax) hitXMax = false;
+      if (escapingYMin) hitYMin = false;
+      if (escapingYMax) hitYMax = false;
+
+      if (hitXMin || hitXMax || hitYMin || hitYMax) {
+        if (hitXMin || hitXMax) handleLiveLimitHit('X', hitXMin ? -1 : +1, xAbs, yAbs);
+        if (hitYMin || hitYMax) handleLiveLimitHit('Y', hitYMin ? -1 : +1, xAbs, yAbs);
+        vx_t = 0.0f;
+        vy_t = 0.0f;
+        hardStopNow = true;
+      }
+    }
+
+    s_prevLiveHallX = liveHallX;
+    s_prevLiveHallY = liveHallY;
+
+    if (hardStopNow) {
+      vA_cur = 0.0f;
+      vB_cur = 0.0f;
+      stepGenSetA(0, +1);
+      stepGenSetB(0, +1);
+      vTaskDelay(1);
+      continue;
+    }
+
+    // -----------------------------------------------------------------------
     // Edge soft limits.
     // -----------------------------------------------------------------------
     long yMinUse, yMaxUse, xMinUse, xMaxUse;
-    if (calibY) { yMinUse = -200000; yMaxUse = +200000; } else { getYLimits(yMinUse, yMaxUse); }
-    if (calibX) { xMinUse = -200000; xMaxUse = +200000; } else { getXLimits(xMinUse, xMaxUse); }
+    bool refSeekActive;
+    char refSeekAxis;
+    portENTER_CRITICAL(&gMux);
+    refSeekActive = g_tuneRefSeekActive;
+    refSeekAxis = g_tuneRefSeekAxis;
+    portEXIT_CRITICAL(&gMux);
+
+    const bool refSeekY = refSeekActive && (refSeekAxis == 'Y');
+    const bool refSeekX = refSeekActive && (refSeekAxis == 'X');
+
+    if (calibY || refSeekY) { yMinUse = -200000; yMaxUse = +200000; } else { getYLimits(yMinUse, yMaxUse); }
+    if (calibX || refSeekX) { xMinUse = -200000; xMaxUse = +200000; } else { getXLimits(xMinUse, xMaxUse); }
 
     vx_t = applyEdgeLimit1D(vx_t, xAbs, xMinUse, xMaxUse);
     vy_t = applyEdgeLimit1D(vy_t, yAbs, yMinUse, yMaxUse);

@@ -25,6 +25,11 @@ static const int HALL_X_PIN = 35;
 
 extern volatile bool g_hallYDetected;
 extern volatile bool g_hallXDetected;
+extern volatile bool g_liveLimitFault;
+extern volatile char g_liveLimitAxis;   // 'X' or 'Y'
+extern volatile int8_t g_liveLimitDir;  // -1 = min edge, +1 = max edge
+extern volatile bool g_tuneRefSeekActive;
+extern volatile char g_tuneRefSeekAxis; // 'X' or 'Y'
 
 extern int lastHallYState;
 extern int lastHallXState;
@@ -36,8 +41,10 @@ extern unsigned long lastHallPollMs;
 static const long  Y_SPAN_STEPS   = 9300;
 static const long  X_SPAN_STEPS   = 8525;
 
-static const float CALIB_Y_SPEED  = 4000.0f;
-static const float CALIB_X_SPEED  = 4000.0f;
+static const float CALIB_Y_SPEED  = 1200.0f;
+static const float CALIB_X_SPEED  = 1200.0f;
+extern volatile float g_calibYSpeed;
+extern volatile float g_calibXSpeed;
 
 static const int   CALIB_Y_DIR    = -1;
 static const int   CALIB_X_DIR    = -1;
@@ -343,6 +350,7 @@ extern volatile bool      g_tuneAbortReq;
 struct TuneSettings {
     float    safeSpeed;      // validated safe axis speed (steps/s) — straight lines
     float    safeSpeedDiag;  // validated safe diagonal speed (steps/s) — 45° moves
+    float    calibSpeed;     // validated Hall calibration seek speed (steps/s)
     float    safeAccel;      // validated safe acceleration (steps/s²)
     float    safeDecel;      // validated safe deceleration (steps/s²)
     uint16_t motorCurrent;   // validated cruise current (mA)
@@ -359,6 +367,7 @@ extern volatile float g_overrideVmax;     // axis speed override (steps/s)
 extern volatile float g_overrideDiagVmax; // diagonal speed override (steps/s); 0 = same as g_overrideVmax
 extern volatile float g_overrideAccel;    // acceleration override (steps/s²)
 extern volatile float g_overrideDecel;    // deceleration override (steps/s²)
+extern volatile float g_pathSpeedScale;   // per-move path speed multiplier
 extern volatile uint16_t g_tuneCurrentMa; // current level presently under test by AutoTune
 extern volatile float g_tuneLiveAxisSpeed; // Auto Tune axis speed presently being evaluated
 extern volatile float g_tuneLiveDiagSpeed; // Auto Tune diagonal speed presently being evaluated

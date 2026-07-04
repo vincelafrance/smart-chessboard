@@ -21,6 +21,7 @@ void setup() {
   Serial.begin(115200);
   delay(400);
   Serial.println("\nHELLO ESP32 - serial ok");
+  Serial.println("[FW] SmartChessboard AutoTune guarded-ref v2026-07-04j");
 
   esp_task_wdt_deinit();
 

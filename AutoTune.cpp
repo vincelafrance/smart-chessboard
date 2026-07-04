@@ -81,32 +81,41 @@ static const int AT_REPEAT_QUICK = 1;
 // Speed ramp — diagonal tests (steps/s, low → high).
 // ONE motor runs at √2× carriage speed during 45° moves — the stall-critical case.
 // Diagonals are intentionally kept around half the straight-line speed range.
-static const float    AT_SPEEDS_DIAG[]      = {3500.f, 4500.f, 6000.f};
+static const float    AT_SPEEDS_DIAG[]      = {1800.f, 2500.f, 3200.f, 4000.f, 5000.f, 6000.f, 7000.f};
 static const uint8_t  AT_N_SPEEDS_DIAG      = sizeof(AT_SPEEDS_DIAG)/sizeof(AT_SPEEDS_DIAG[0]);
 // Speed ramp — axis-only tests (steps/s).
 // Both motors share load more evenly on straight moves, so the carriage can
 // usually run substantially faster than on 45° diagonals at the same current.
-static const float    AT_SPEEDS_AXIS[]      = {7000.f, 9000.f, 11000.f, 12500.f};
+static const float    AT_SPEEDS_AXIS[]      = {4500.f, 6500.f, 8500.f, 10500.f, 12500.f, 14500.f};
 static const uint8_t  AT_N_SPEEDS_AXIS      = sizeof(AT_SPEEDS_AXIS)/sizeof(AT_SPEEDS_AXIS[0]);
 
 // Fixed acceleration used during speed-ramp test sessions (not tuned; hardware ramp constants apply at runtime).
-static const float    AT_BASELINE_ACCEL  = 9000.0f;
+static const float    AT_BASELINE_ACCEL  = 6000.0f;
 
 // Current sweep (mA, low → high).
 // Auto Tune now starts from the lowest current and only climbs if needed.
 static const uint16_t AT_CURRENTS[]       = {950, 1050, 1150, 1300, 1500};
 static const uint8_t  AT_N_CURRENTS       = sizeof(AT_CURRENTS)/sizeof(AT_CURRENTS[0]);
 
+// Keep the normal AutoTune path focused on reaching a stable, usable result.
+// These optional optimisation passes add a lot of runtime and can turn an
+// otherwise good tune into a late-stage failure on small mechanical variance.
+static const bool AT_ENABLE_EFFICIENCY_CHECK = false;
+static const bool AT_ENABLE_SPEED_RECLAIM    = false;
+static const bool AT_USE_SPREADCYCLE         = true;
+
 // NVS keys
 static const char NVS_NS[]         = "chess_tune";
 static const char NVS_SPEED[]      = "safeSpeed";
 static const char NVS_SPEED_DIAG[] = "safeSpdDiag";
+static const char NVS_CALIB_SPEED[]= "calibSpd";
 static const char NVS_CURRENT[]    = "motorMa";
 static const char NVS_TUNE_OK[]    = "tuneValid";
 static const char NVS_BOUNDS_OK[]  = "boundsValid";
 
 static const float    NVS_DEF_SPEED      = 8600.0f;
 static const float    NVS_DEF_SPEED_DIAG = 6000.0f;
+static const float    NVS_DEF_CALIB_SPEED= 1200.0f;
 static const uint16_t NVS_DEF_CURRENT    = 850;
 
 // ============================================================
@@ -114,10 +123,12 @@ static const uint16_t NVS_DEF_CURRENT    = 850;
 // ============================================================
 static TaskHandle_t s_taskHandle = nullptr;
 static Preferences  s_prefs;
+static bool         s_prevSpreadCycle = false;
 
 static void applyTuneCurrentMa(uint16_t mA);
 static void setTuneLiveSettings(float axisSpeed, float diagSpeed, float accel, float decel);
 static float axisSpeedForDiagSpeed(float diagSpeed);
+static bool guardedSeekHallMin(char axis, long &hitPos, float seekSpeed = 850.0f);
 
 // ============================================================
 // Logging  (UNCHANGED)
@@ -152,12 +163,14 @@ void saveSettings() {
     s_prefs.begin(NVS_NS, false);
     s_prefs.putFloat(NVS_SPEED,      g_tuneSettings.safeSpeed);
     s_prefs.putFloat(NVS_SPEED_DIAG, g_tuneSettings.safeSpeedDiag);
+    s_prefs.putFloat(NVS_CALIB_SPEED,g_tuneSettings.calibSpeed);
     s_prefs.putUShort(NVS_CURRENT,   g_tuneSettings.motorCurrent);
     s_prefs.putBool(NVS_TUNE_OK,     g_tuneSettings.tuningValid);
     s_prefs.putBool(NVS_BOUNDS_OK,   g_tuneSettings.boundsValid);
     s_prefs.end();
-    Serial.printf("[AT] Saved: axisSpd=%.0f diagSpd=%.0f current=%u\n",
+    Serial.printf("[AT] Saved: axisSpd=%.0f diagSpd=%.0f calibSpd=%.0f current=%u\n",
                   g_tuneSettings.safeSpeed, g_tuneSettings.safeSpeedDiag,
+                  g_tuneSettings.calibSpeed,
                   (unsigned)g_tuneSettings.motorCurrent);
 }
 
@@ -165,6 +178,7 @@ void loadSettings() {
     s_prefs.begin(NVS_NS, true);
     g_tuneSettings.safeSpeed     = s_prefs.getFloat(NVS_SPEED,      NVS_DEF_SPEED);
     g_tuneSettings.safeSpeedDiag = s_prefs.getFloat(NVS_SPEED_DIAG, NVS_DEF_SPEED_DIAG);
+    g_tuneSettings.calibSpeed    = s_prefs.getFloat(NVS_CALIB_SPEED,NVS_DEF_CALIB_SPEED);
     g_tuneSettings.motorCurrent  = s_prefs.getUShort(NVS_CURRENT,   NVS_DEF_CURRENT);
     g_tuneSettings.tuningValid   = s_prefs.getBool(NVS_TUNE_OK,     false);
     g_tuneSettings.boundsValid   = s_prefs.getBool(NVS_BOUNDS_OK,   false);
@@ -173,15 +187,22 @@ void loadSettings() {
     // Accel/decel are NOT overridden from NVS — hardware ramp constants handle them.
     g_tuneSettings.safeAccel = 0.0f;
     g_tuneSettings.safeDecel = 0.0f;
+    if (g_tuneSettings.calibSpeed < 600.0f) g_tuneSettings.calibSpeed = NVS_DEF_CALIB_SPEED;
 
     if (g_tuneSettings.tuningValid) {
+        setDriversSpreadCycle(AT_USE_SPREADCYCLE);
         g_overrideVmax     = g_tuneSettings.safeSpeed;
         g_overrideDiagVmax = g_tuneSettings.safeSpeedDiag;
+        g_calibYSpeed      = g_tuneSettings.calibSpeed;
+        g_calibXSpeed      = g_tuneSettings.calibSpeed;
         setMotionProfileLock(true, AT_LOCKED_MICROSTEPS, g_tuneSettings.motorCurrent);
-        Serial.printf("[AT] Loaded: axisSpd=%.0f diagSpd=%.0f current=%u (VALID)\n",
+        Serial.printf("[AT] Loaded: axisSpd=%.0f diagSpd=%.0f calibSpd=%.0f current=%u (VALID)\n",
                       g_tuneSettings.safeSpeed, g_tuneSettings.safeSpeedDiag,
+                      g_tuneSettings.calibSpeed,
                       (unsigned)g_tuneSettings.motorCurrent);
     } else {
+        g_calibYSpeed = CALIB_Y_SPEED;
+        g_calibXSpeed = CALIB_X_SPEED;
         setMotionProfileLock(false, AT_LOCKED_MICROSTEPS, 0);
         Serial.println("[AT] No valid tune in NVS — using firmware defaults.");
     }
@@ -200,6 +221,9 @@ static void atEmergencyStop(const char *reason) {
     g_wpCount        = 0;
     g_wpIndex        = 0;
     g_autoMagnetPath = false;
+    g_pathSpeedScale = 1.0f;
+    g_tuneRefSeekActive = false;
+    g_tuneRefSeekAxis   = 0;
     portEXIT_CRITICAL(&gMux);
     g_overrideVmax  = 0.0f;
     g_overrideAccel = 0.0f;
@@ -238,6 +262,9 @@ static ArriveResult tuneMoveTo(long x, long y,
     y = clampl(y, yMin + guard, yMax - guard);
 
     portENTER_CRITICAL(&gMux);
+    g_liveLimitFault = false;
+    g_liveLimitAxis  = 0;
+    g_liveLimitDir   = 0;
     g_xCenterTarget = x;
     g_yCenterTarget = y;
     g_recenter      = true;
@@ -256,16 +283,50 @@ static ArriveResult tuneMoveTo(long x, long y,
             return AR_ABORT;
         }
         bool r;
+        bool liveLimit;
+        char liveAxis;
+        int8_t liveDir;
         portENTER_CRITICAL(&gMux);
         r = g_recenter;
+        liveLimit = g_liveLimitFault;
+        liveAxis = g_liveLimitAxis;
+        liveDir = g_liveLimitDir;
         portEXIT_CRITICAL(&gMux);
+        if (liveLimit) {
+            long px, py, tx, ty;
+            int hx = digitalRead(HALL_X_PIN);
+            int hy = digitalRead(HALL_Y_PIN);
+            portENTER_CRITICAL(&gMux);
+            px = g_xAbs;
+            py = g_yAbs;
+            tx = g_xCenterTarget;
+            ty = g_yCenterTarget;
+            portEXIT_CRITICAL(&gMux);
+            atLog("tuneMoveTo: live %c-%s limit hit pos=(%ld,%ld) target=(%ld,%ld) hallX=%s hallY=%s",
+                  liveAxis,
+                  liveDir < 0 ? "MIN" : "MAX",
+                  px, py,
+                  tx, ty,
+                  hx == LOW ? "LOW" : "HIGH",
+                  hy == LOW ? "LOW" : "HIGH");
+            return AR_TIMEOUT;
+        }
         if (!r) return AR_OK;
         vTaskDelay(20 / portTICK_PERIOD_MS);
     }
     portENTER_CRITICAL(&gMux);
+    long px = g_xAbs;
+    long py = g_yAbs;
+    long tx = g_xCenterTarget;
+    long ty = g_yCenterTarget;
     g_recenter = false;
     g_vx_xy = 0.0f; g_vy_xy = 0.0f;
     portEXIT_CRITICAL(&gMux);
+    atLog("tuneMoveTo: TIMEOUT pos=(%ld,%ld) target=(%ld,%ld) hallX=%s hallY=%s",
+          px, py,
+          tx, ty,
+          digitalRead(HALL_X_PIN) == LOW ? "LOW" : "HIGH",
+          digitalRead(HALL_Y_PIN) == LOW ? "LOW" : "HIGH");
     return AR_TIMEOUT;
 }
 
@@ -289,6 +350,9 @@ static ArriveResult tuneMoveToPath(long x, long y,
     y = clampl(y, yMin + guard, yMax - guard);
 
     portENTER_CRITICAL(&gMux);
+    g_liveLimitFault = false;
+    g_liveLimitAxis  = 0;
+    g_liveLimitDir   = 0;
     g_waypoints[0]   = { x, y, -1 };
     g_wpCount        = 1;
     g_wpIndex        = 0;
@@ -298,6 +362,7 @@ static ArriveResult tuneMoveToPath(long x, long y,
     g_recenter       = false;
     g_vx_xy          = 0.0f;
     g_vy_xy          = 0.0f;
+    g_pathSpeedScale = 1.0f;
     g_autoMagnetPath = false;   // never touch the magnet during tuning
     g_lastCmdMs      = millis();
     portEXIT_CRITICAL(&gMux);
@@ -310,22 +375,63 @@ static ArriveResult tuneMoveToPath(long x, long y,
             g_wpCount        = 0;
             g_wpIndex        = 0;
             g_autoMagnetPath = false;
+            g_pathSpeedScale = 1.0f;
             portEXIT_CRITICAL(&gMux);
             return AR_ABORT;
         }
         bool active;
+        bool liveLimit;
+        char liveAxis;
+        int8_t liveDir;
         portENTER_CRITICAL(&gMux);
         active = g_pathActive;
+        liveLimit = g_liveLimitFault;
+        liveAxis = g_liveLimitAxis;
+        liveDir = g_liveLimitDir;
         portEXIT_CRITICAL(&gMux);
+        if (liveLimit) {
+            long px, py, tx, ty;
+            int hx = digitalRead(HALL_X_PIN);
+            int hy = digitalRead(HALL_Y_PIN);
+            portENTER_CRITICAL(&gMux);
+            px = g_xAbs;
+            py = g_yAbs;
+            tx = g_pathTargetX;
+            ty = g_pathTargetY;
+            g_pathActive     = false;
+            g_wpCount        = 0;
+            g_wpIndex        = 0;
+            g_autoMagnetPath = false;
+            g_pathSpeedScale = 1.0f;
+            portEXIT_CRITICAL(&gMux);
+            atLog("tuneMoveToPath: live %c-%s limit hit pos=(%ld,%ld) target=(%ld,%ld) hallX=%s hallY=%s",
+                  liveAxis,
+                  liveDir < 0 ? "MIN" : "MAX",
+                  px, py,
+                  tx, ty,
+                  hx == LOW ? "LOW" : "HIGH",
+                  hy == LOW ? "LOW" : "HIGH");
+            return AR_TIMEOUT;
+        }
         if (!active) return AR_OK;
         vTaskDelay(20 / portTICK_PERIOD_MS);
     }
     portENTER_CRITICAL(&gMux);
+    long px = g_xAbs;
+    long py = g_yAbs;
+    long tx = g_pathTargetX;
+    long ty = g_pathTargetY;
     g_pathActive     = false;
     g_wpCount        = 0;
     g_wpIndex        = 0;
     g_autoMagnetPath = false;
+    g_pathSpeedScale = 1.0f;
     portEXIT_CRITICAL(&gMux);
+    atLog("tuneMoveToPath: TIMEOUT pos=(%ld,%ld) target=(%ld,%ld) hallX=%s hallY=%s",
+          px, py,
+          tx, ty,
+          digitalRead(HALL_X_PIN) == LOW ? "LOW" : "HIGH",
+          digitalRead(HALL_Y_PIN) == LOW ? "LOW" : "HIGH");
     return AR_TIMEOUT;
 }
 
@@ -333,17 +439,57 @@ static ArriveResult tuneMoveToPath(long x, long y,
 // REFERENCE LAYER  (UNCHANGED)
 // ============================================================
 static bool referenceHomeCorner(long &yMin, long &xMin) {
-    atLog("referenceHomeCorner...");
-    startFullCalibration();
-    if (!waitForCalibration()) {
-        atLog("referenceHomeCorner: FAILED");
+    atLog("referenceHomeCorner: guarded Hall probe...");
+    long hitY, hitX;
+    if (!guardedSeekHallMin('Y', hitY)) {
+        atLog("referenceHomeCorner: Y probe FAILED");
         return false;
     }
+    vTaskDelay(80 / portTICK_PERIOD_MS);
+    if (!guardedSeekHallMin('X', hitX)) {
+        atLog("referenceHomeCorner: X probe FAILED");
+        return false;
+    }
+
+    long oldYMin, oldYMax, oldXMin, oldXMax;
     portENTER_CRITICAL(&gMux);
+    oldYMin = g_yHardMin;
+    oldYMax = g_yHardMax;
+    oldXMin = g_xHardMin;
+    oldXMax = g_xHardMax;
+    portEXIT_CRITICAL(&gMux);
+
+    long spanY = labs(oldYMax - oldYMin);
+    long spanX = labs(oldXMax - oldXMin);
+    if (spanY < 1000L) spanY = labs(Y_HARD_MAX_DEFAULT - Y_HARD_MIN_DEFAULT);
+    if (spanX < 1000L) spanX = labs(X_HARD_MAX_DEFAULT - X_HARD_MIN_DEFAULT);
+
+    long newYMin = HALL_AT_Y_MIN ? hitY : hitY - spanY;
+    long newYMax = HALL_AT_Y_MIN ? hitY + spanY : hitY;
+    long newXMin = HALL_AT_X_MIN ? hitX : hitX - spanX;
+    long newXMax = HALL_AT_X_MIN ? hitX + spanX : hitX;
+    if (newYMin > newYMax) { long t = newYMin; newYMin = newYMax; newYMax = t; }
+    if (newXMin > newXMax) { long t = newXMin; newXMin = newXMax; newXMax = t; }
+
+    const long newYCenter = (newYMin + newYMax) / 2L;
+    const long newXCenter = (newXMin + newXMax) / 2L;
+
+    portENTER_CRITICAL(&gMux);
+    g_yHardMin = newYMin;
+    g_yHardMax = newYMax;
+    g_xHardMin = newXMin;
+    g_xHardMax = newXMax;
+    g_yCenterTarget = newYCenter;
+    g_xCenterTarget = newXCenter;
+    g_yLimitsCalibrated = true;
+    g_xLimitsCalibrated = true;
     yMin = g_yHardMin;
     xMin = g_xHardMin;
     portEXIT_CRITICAL(&gMux);
-    atLog("homeCorner: y=%ld x=%ld", yMin, xMin);
+
+    setRawABfromXY(xMin, yMin);
+    atLog("homeCorner: y=%ld x=%ld (hit y=%ld x=%ld spanY=%ld spanX=%ld center y=%ld x=%ld)",
+          yMin, xMin, hitY, hitX, spanY, spanX, newYCenter, newXCenter);
     return true;
 }
 
@@ -361,25 +507,14 @@ static bool referenceMaxCorner(long &yMax, long &xMax) {
 // ============================================================
 // FAST HOME-CORNER REFERENCE CHECK
 // ============================================================
-// Drive toward the home corner using the normal calibration state
-// machine; abort after both hall sensors have fired at the bottom
-// corner.  Much faster than a full 4-corner calibration because
-// only the home (min) corner is used.
-//
-// Pre-approach:  tuneMoveTo() drives at full session speed to within
-//   AT_FASTREF_APPROACH_STEPS of the expected corner position.
-// Slow-seek:     startFullCalibration() then takes over at CALIB speed
-//   (~700 steps/s) for the final approach and hall detection.
-// After both sensors fire, the calibration is aborted and the carriage
-// is returned to the board centre.
-//
-// Typical duration from board centre:
-//   ~0.7s pre-approach  +  ~0.9s Y-seek  +  ~0.9s X-seek  +  ~0.7s return
-//   ≈ 3-4 seconds total
+// AutoTune drift checks cannot trust the current step position if missed steps
+// are exactly what we are trying to detect.  So the reference check uses a
+// guarded low-speed Hall probe: seek Y-min until Hall, stop, then seek X-min
+// until Hall.  The step counter is only used as a maximum-travel failsafe.
 // ============================================================
 
-static const long          AT_FASTREF_APPROACH_STEPS = 600L;
-static const unsigned long AT_FASTREF_TIMEOUT_MS     = 18000UL;
+static const float         AT_REF_SEEK_SPEED         = 850.0f;
+static const long          AT_REF_MAX_EXTRA_STEPS    = 1200L;
 
 enum FastRefResult : uint8_t { FR_OK = 0, FR_TIMEOUT, FR_ABORT };
 
@@ -396,6 +531,215 @@ struct DriftMeasure {
     bool  exceeded;   // magnitude > AT_MAX_DRIFT_STEPS
 };
 
+static void stopTuneVelocity() {
+    portENTER_CRITICAL(&gMux);
+    g_vx_xy      = 0.0f;
+    g_vy_xy      = 0.0f;
+    g_recenter   = false;
+    g_pathActive = false;
+    g_wpCount    = 0;
+    g_wpIndex    = 0;
+    g_pathSpeedScale = 1.0f;
+    g_tuneRefSeekActive = false;
+    g_tuneRefSeekAxis   = 0;
+    g_lastCmdMs  = millis();
+    portEXIT_CRITICAL(&gMux);
+}
+
+static bool guardedSeekHallMin(char axis, long &hitPos, float seekSpeed) {
+    seekSpeed = clampf(seekSpeed, 400.0f, 6000.0f);
+    long xMin, xMax, yMin, yMax;
+    getXLimits(xMin, xMax);
+    getYLimits(yMin, yMax);
+
+    const float seekDir = (axis == 'Y')
+                        ? (HALL_AT_Y_MIN ? (float)CALIB_Y_DIR : -(float)CALIB_Y_DIR)
+                        : (HALL_AT_X_MIN ? (float)CALIB_X_DIR : -(float)CALIB_X_DIR);
+
+    const int hallPin = (axis == 'Y') ? HALL_Y_PIN : HALL_X_PIN;
+    const int hallAtMin = (axis == 'Y') ? HALL_AT_Y_MIN : HALL_AT_X_MIN;
+    const long minLimit = (axis == 'Y') ? yMin : xMin;
+    const long maxLimit = (axis == 'Y') ? yMax : xMax;
+
+    long startPos;
+    long startX;
+    long startY;
+    int hallStartRaw;
+    portENTER_CRITICAL(&gMux);
+    startX = g_xAbs;
+    startY = g_yAbs;
+    startPos = (axis == 'Y') ? startY : startX;
+    g_liveLimitFault = false;
+    g_liveLimitAxis  = 0;
+    g_liveLimitDir   = 0;
+    g_recenter       = false;
+    g_pathActive     = false;
+    g_wpCount        = 0;
+    g_wpIndex        = 0;
+    g_autoMagnetPath = false;
+    g_pathSpeedScale = 1.0f;
+    g_tuneRefSeekActive = true;
+    g_tuneRefSeekAxis   = axis;
+    g_vx_xy          = (axis == 'X') ? seekDir * seekSpeed : 0.0f;
+    g_vy_xy          = (axis == 'Y') ? seekDir * seekSpeed : 0.0f;
+    g_lastCmdMs      = millis();
+    portEXIT_CRITICAL(&gMux);
+    hallStartRaw = digitalRead(hallPin);
+
+    const long span = (axis == 'Y') ? labs(yMax - yMin) : labs(xMax - xMin);
+    const long maxTravel = span + AT_REF_MAX_EXTRA_STEPS;
+    const unsigned long seekTimeoutMs =
+        (unsigned long)(((float)maxTravel / seekSpeed) * 1000.0f) + 8000UL;
+    const unsigned long startMs = millis();
+    unsigned long lastProgressLogMs = startMs;
+    unsigned long lastNoMoveLogMs = startMs;
+    long lastLogPos = startPos;
+
+    atLog("guardedRef: %c-min start pos=%ld xy=(%ld,%ld) limits=[%ld..%ld] span=%ld maxTravel=%ld dir=%+.0f speed=%.0f hallPin=%d hallStart=%s hallAtMin=%d timeout=%lu",
+          axis,
+          startPos,
+          startX,
+          startY,
+          minLimit,
+          maxLimit,
+          span,
+          maxTravel,
+          seekDir,
+          seekSpeed,
+          hallPin,
+          hallStartRaw == LOW ? "LOW" : "HIGH",
+          hallAtMin,
+          seekTimeoutMs);
+
+    while (millis() - startMs < seekTimeoutMs) {
+        if (g_tuneAbortReq) {
+            stopTuneVelocity();
+            atLog("guardedRef: %c-min aborted by request", axis);
+            return false;
+        }
+
+        const bool hallLow = (axis == 'Y')
+                           ? (digitalRead(HALL_Y_PIN) == LOW)
+                           : (digitalRead(HALL_X_PIN) == LOW);
+
+        long posNow;
+        long xNow;
+        long yNow;
+        float vxNow;
+        float vyNow;
+        bool liveLimit;
+        char liveAxis;
+        int8_t liveDir;
+        portENTER_CRITICAL(&gMux);
+        xNow = g_xAbs;
+        yNow = g_yAbs;
+        posNow = (axis == 'Y') ? yNow : xNow;
+        vxNow = g_vx_xy;
+        vyNow = g_vy_xy;
+        liveLimit = g_liveLimitFault;
+        liveAxis = g_liveLimitAxis;
+        liveDir = g_liveLimitDir;
+        g_lastCmdMs = millis();
+        portEXIT_CRITICAL(&gMux);
+
+        if (hallLow || liveLimit) {
+            stopTuneVelocity();
+            vTaskDelay(40 / portTICK_PERIOD_MS);
+            portENTER_CRITICAL(&gMux);
+            hitPos = (axis == 'Y') ? g_yAbs : g_xAbs;
+            if (axis == 'Y') g_yHallPos = hitPos;
+            else             g_xHallPos = hitPos;
+            portEXIT_CRITICAL(&gMux);
+            atLog("guardedRef: %c-min stop by %s at %ld travel=%ld live=%d liveAxis=%c liveDir=%d",
+                  axis,
+                  hallLow ? "Hall" : "liveLimit",
+                  hitPos,
+                  labs(hitPos - startPos),
+                  liveLimit ? 1 : 0,
+                  liveAxis ? liveAxis : '-',
+                  (int)liveDir);
+            return true;
+        }
+
+        if (labs(posNow - startPos) > maxTravel) {
+            stopTuneVelocity();
+            atLog("guardedRef: %c-min seek exceeded max travel: pos=%ld start=%ld travel=%ld maxTravel=%ld hall=%s vx=%.1f vy=%.1f",
+                  axis,
+                  posNow,
+                  startPos,
+                  labs(posNow - startPos),
+                  maxTravel,
+                  hallLow ? "LOW" : "HIGH",
+                  vxNow,
+                  vyNow);
+            return false;
+        }
+
+        const unsigned long nowMs = millis();
+        if (nowMs - lastProgressLogMs >= 1000UL) {
+            atLog("guardedRef: %c-min progress t=%lu pos=%ld travel=%ld deltaLast=%ld xy=(%ld,%ld) hall=%s vx=%.1f vy=%.1f live=%d",
+                  axis,
+                  nowMs - startMs,
+                  posNow,
+                  posNow - startPos,
+                  posNow - lastLogPos,
+                  xNow,
+                  yNow,
+                  hallLow ? "LOW" : "HIGH",
+                  vxNow,
+                  vyNow,
+                  liveLimit ? 1 : 0);
+            lastProgressLogMs = nowMs;
+            lastLogPos = posNow;
+        }
+
+        if ((nowMs - startMs >= 1500UL) && (labs(posNow - startPos) < 50L) &&
+            (nowMs - lastNoMoveLogMs >= 1500UL)) {
+            atLog("guardedRef: %c-min WARNING little/no movement: pos=%ld start=%ld travel=%ld commanded vx=%.1f vy=%.1f hall=%s",
+                  axis,
+                  posNow,
+                  startPos,
+                  labs(posNow - startPos),
+                  vxNow,
+                  vyNow,
+                  hallLow ? "LOW" : "HIGH");
+            lastNoMoveLogMs = nowMs;
+        }
+
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+
+    stopTuneVelocity();
+    long endPos;
+    long endX;
+    long endY;
+    bool endLive;
+    char endLiveAxis;
+    int8_t endLiveDir;
+    portENTER_CRITICAL(&gMux);
+    endX = g_xAbs;
+    endY = g_yAbs;
+    endPos = (axis == 'Y') ? endY : endX;
+    endLive = g_liveLimitFault;
+    endLiveAxis = g_liveLimitAxis;
+    endLiveDir = g_liveLimitDir;
+    portEXIT_CRITICAL(&gMux);
+    const int hallEndRaw = digitalRead(hallPin);
+    atLog("guardedRef: %c-min seek TIMEOUT after %lu ms: start=%ld end=%ld travel=%ld xy=(%ld,%ld) hallEnd=%s live=%d liveAxis=%c liveDir=%d",
+          axis,
+          seekTimeoutMs,
+          startPos,
+          endPos,
+          endPos - startPos,
+          endX,
+          endY,
+          hallEndRaw == LOW ? "LOW" : "HIGH",
+          endLive ? 1 : 0,
+          endLiveAxis ? endLiveAxis : '-',
+          (int)endLiveDir);
+    return false;
+}
+
 static FastRefResult fastHomeCornerCheck(long refYMin, long refXMin,
                                           DriftMeasure &out) {
     long cx, cy;
@@ -404,118 +748,32 @@ static FastRefResult fastHomeCornerCheck(long refYMin, long refXMin,
     cy = g_yCenterTarget;
     portEXIT_CRITICAL(&gMux);
 
-    // ── Step 1: Fast pre-approach — drive to just outside the home corner ──
-    // Clamped so we stay within the safe zone even if the reference is stale.
-    long xMin, xMax, yMin, yMax;
-    getXLimits(xMin, xMax);
-    getYLimits(yMin, yMax);
-    const long guard = EDGE_STOP_DIST + 80;
-
-    long preX = refXMin + AT_FASTREF_APPROACH_STEPS;
-    long preY = refYMin + AT_FASTREF_APPROACH_STEPS;
-    preX = clampl(preX, xMin + guard, xMax - guard);
-    preY = clampl(preY, yMin + guard, yMax - guard);
-
-    ArriveResult ar = tuneMoveTo(preX, preY, 10000UL);
-    if (ar == AR_ABORT)   return FR_ABORT;
-    if (ar == AR_TIMEOUT) {
-        atLog("fastRef: pre-approach TIMEOUT");
-        return FR_TIMEOUT;
-    }
-    vTaskDelay(60 / portTICK_PERIOD_MS);
-
-    // ── Step 2: Verify hall sensors are not yet triggered ──
-    // At preX/preY (~600 steps from the corner) they should always be HIGH.
-    // If they are LOW, drift has moved the corner position significantly.
-    if (digitalRead(HALL_Y_PIN) == LOW || digitalRead(HALL_X_PIN) == LOW) {
-        atLog("fastRef: hall LOW at pre-approach — drift too large to measure");
-        tuneMoveTo(cx, cy);
-        return FR_TIMEOUT;
-    }
-
-    // ── Step 3: Launch calibration slow-seek toward home corner ──
-    // StepTask drives at CALIB_Y_SPEED (700 steps/s) in -Y, then -X.
-    // calibrationLoop() watches hall sensors and advances the state machine.
-    startFullCalibration();
-
-    // ── Step 4: Wait until BOTH bottom-corner sensors have fired ──
-    // Transition path:  CALIB_Y_BOTTOM → (Y fires) → CALIB_X_BOTTOM
-    //                   CALIB_X_BOTTOM → (X fires) → CALIB_Y_TOP
-    //
-    // EARLY-EXIT: When the state machine enters CALIB_X_BOTTOM it starts
-    // driving -X.  If the carriage has drifted enough that X is already
-    // sitting on its hall sensor (HALL_X_PIN == LOW), driving further into
-    // the wall causes a physical crash.  We detect this immediately and
-    // abort the calibration, treating the current X position as the hall hit.
-    unsigned long start = millis();
-    bool found     = false;
-    bool xEarlyHit = false;  // true when we used the early-exit path for X
-    while (millis() - start < AT_FASTREF_TIMEOUT_MS) {
-        if (g_tuneAbortReq) {
-            portENTER_CRITICAL(&gMux);
-            g_calibState = CALIB_IDLE;
-            g_vx_xy = 0.0f; g_vy_xy = 0.0f;
-            portEXIT_CRITICAL(&gMux);
-            return FR_ABORT;
-        }
-        CalibState st;
-        portENTER_CRITICAL(&gMux);
-        st = g_calibState;
-        portEXIT_CRITICAL(&gMux);
-
-        // ── Early-exit: X hall already triggered at CALIB_X_BOTTOM entry ──
-        // The calibration just finished Y-seek and is about to drive -X.
-        // If X hall is already LOW the carriage is at the corner in both axes;
-        // record current X position and abort instead of driving into the wall.
-        if (st == CALIB_X_BOTTOM && digitalRead(HALL_X_PIN) == LOW) {
-            portENTER_CRITICAL(&gMux);
-            g_calibState = CALIB_IDLE;
-            g_vx_xy = 0.0f; g_vy_xy = 0.0f;
-            portEXIT_CRITICAL(&gMux);
-            xEarlyHit = true;
-            found     = true;
-            atLog("fastRef: X hall already LOW at CALIB_X_BOTTOM — skipping X seek");
-            break;
-        }
-
-        // Normal path: both bottom sensors fired, state advanced past X-bottom
-        if (st == CALIB_Y_TOP  || st == CALIB_X_TOP ||
-            st == CALIB_RECENTER || st == CALIB_IDLE) {
-            found = true;
-            break;
-        }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
-
-    if (!found) {
-        portENTER_CRITICAL(&gMux);
-        g_calibState = CALIB_IDLE;
-        g_vx_xy = 0.0f; g_vy_xy = 0.0f;
-        portEXIT_CRITICAL(&gMux);
-        atLog("fastRef: TIMEOUT waiting for home-corner sensors");
-        tuneMoveTo(cx, cy);
-        return FR_TIMEOUT;
-    }
-
-    // ── Step 5: Capture detected positions; abort rest of calibration ──
-    // For the early-exit path, g_xHallPos was never written by the state machine,
-    // so we use g_xAbs (the current physical position) as the X hit position.
     long hitY, hitX;
-    portENTER_CRITICAL(&gMux);
-    hitY = g_yHallPos;
-    hitX = xEarlyHit ? g_xAbs : g_xHallPos;
-    g_calibState = CALIB_IDLE;
-    g_vx_xy = 0.0f;
-    g_vy_xy = 0.0f;
-    portEXIT_CRITICAL(&gMux);
+    if (!guardedSeekHallMin('Y', hitY)) {
+        tuneMoveTo(cx, cy);
+        return g_tuneAbortReq ? FR_ABORT : FR_TIMEOUT;
+    }
+    vTaskDelay(80 / portTICK_PERIOD_MS);
 
-    // ── Step 6: Compute drift vs phase-start reference ──
+    if (!guardedSeekHallMin('X', hitX)) {
+        tuneMoveTo(cx, cy);
+        return g_tuneAbortReq ? FR_ABORT : FR_TIMEOUT;
+    }
+    vTaskDelay(80 / portTICK_PERIOD_MS);
+
+    // ── Compute drift vs phase-start reference ──
     out.actualY   = hitY;
     out.actualX   = hitX;
     out.driftY    = (float)(hitY - refYMin);
     out.driftX    = (float)(hitX - refXMin);
     out.magnitude = sqrtf(out.driftX * out.driftX + out.driftY * out.driftY);
     out.exceeded  = (out.magnitude > AT_MAX_DRIFT_STEPS);
+
+    // The Hall hit tells us the physical carriage is at the calibrated home
+    // corner.  After measuring drift, snap the logical step counters back to
+    // that known physical reference so the next return-to-centre and test do
+    // not inherit the drifted coordinate frame.
+    setRawABfromXY(refXMin, refYMin);
 
     if (g_driftCount < MAX_DRIFT_LOG) {
         g_driftLog[g_driftCount].driftX = out.driftX;
@@ -528,7 +786,7 @@ static FastRefResult fastHomeCornerCheck(long refYMin, long refXMin,
           hitX, refXMin, out.driftX,
           out.magnitude, out.exceeded ? "FAIL" : "OK");
 
-    // ── Step 7: Return carriage to board centre ──
+    // ── Return carriage to board centre ──
     // g_overrideVmax is still set by the caller (session speed); the
     // return move uses it for full-speed travel back.
     if (tuneMoveTo(cx, cy) == AR_ABORT) return FR_ABORT;
@@ -538,7 +796,7 @@ static FastRefResult fastHomeCornerCheck(long refYMin, long refXMin,
 }
 
 static bool recoverReferenceAfterDrift(long &newYMin, long &newXMin) {
-    atLog("recoverReferenceAfterDrift: stopping and re-homing...");
+    atLog("recoverReferenceAfterDrift: stopping and guarded re-reference...");
     atEmergencyStop("pre-recovery");
     vTaskDelay(600 / portTICK_PERIOD_MS);
     return referenceHomeCorner(newYMin, newXMin);
@@ -1058,7 +1316,22 @@ static bool runTrajectorySession(bool quickMode, bool axisOnly,
     g_overrideDiagVmax = sessionDiagSpeed;
     g_overrideAccel    = sessionAccel;
 
-    if (tuneMoveTo(cx, cy) != AR_OK) {
+    long sx, sy;
+    portENTER_CRITICAL(&gMux);
+    sx = g_xAbs;
+    sy = g_yAbs;
+    portEXIT_CRITICAL(&gMux);
+    const long centerTravel = max(labs(cx - sx), labs(cy - sy));
+    float centerSpeed = sessionAxisSpeed;
+    if (centerSpeed < 600.0f) centerSpeed = 600.0f;
+    unsigned long centerTimeoutMs =
+        (unsigned long)(((float)centerTravel / centerSpeed) * 3000.0f) + 9000UL;
+    if (centerTimeoutMs < 18000UL) centerTimeoutMs = 18000UL;
+    if (centerTimeoutMs > 45000UL) centerTimeoutMs = 45000UL;
+
+    atLog("Session: center start from (%ld,%ld) to (%ld,%ld), travel=%ld timeout=%lu",
+          sx, sy, cx, cy, centerTravel, centerTimeoutMs);
+    if (tuneMoveToPath(cx, cy, centerTimeoutMs) != AR_OK) {
         atLog("Session: failed to reach center at start");
         g_overrideVmax     = 0.0f;
         g_overrideDiagVmax = 0.0f;
@@ -1143,9 +1416,9 @@ static bool runTrajectorySession(bool quickMode, bool axisOnly,
         TrajectoryTest t_run = t;
         if (quickMode && t_run.reps > 1) t_run.reps = 1;
 
-        atLog("[%d/%d] %s  spd=%.0fx%.2f  rep=%u%s",
+        atLog("[%d/%d] %s  axis=%.0f diag=%.0f scale=%.2f  rep=%u%s",
               (int)ti + 1, (int)AT_NUM_TESTS,
-              t.name, sessionDiagSpeed, t.speedScale,
+              t.name, sessionAxisSpeed, sessionDiagSpeed, t.speedScale,
               (unsigned)t_run.reps, t.bidirectional ? " bidi" : "");
 
         TrajRunResult r = runSingleTrajectory(t_run, sessionAxisSpeed, sessionDiagSpeed, sessionAccel);
@@ -1365,35 +1638,32 @@ static uint16_t phaseCurrentTune(long &refYMin, long &refXMin,
                                    float safeDecel) {
     if (startCurrentIdx < 0) startCurrentIdx = 0;
     if (startCurrentIdx >= (int)AT_N_CURRENTS) startCurrentIdx = (int)AT_N_CURRENTS - 1;
-    const int numCurrents = startCurrentIdx + 1;
+    const uint16_t adaptiveCurrent = currentForIndex(startCurrentIdx);
     setPhaseProgress(AT_PHASE_CURRENT, 0);
-    atLog("=== Phase: Current Tune (%d levels, quick suite) ===", numCurrents);
-    atLog("Current sweep params: axisSpeed=%.0f diagSpeed=%.0f accel=%.0f decel=%.0f score>=%.2f",
+    atLog("=== Phase: Current Validation (fast) ===");
+    atLog("Current params: axisSpeed=%.0f diagSpeed=%.0f accel=%.0f decel=%.0f score>=%.2f",
           safeSpeedAxis, safeSpeedDiag, safeAccel, safeDecel, AT_SCORE_PASS_THRESHOLD);
-    atLog("Current minimisation: retesting from lowest current up to %u mA",
-          (unsigned)currentForIndex(startCurrentIdx));
+    atLog("Validating adaptive current first: %u mA", (unsigned)adaptiveCurrent);
 
-    uint16_t lastGoodCurrent = currentForIndex(startCurrentIdx);
-    float    lastGoodScore   = 1.0f;
-    bool     foundPass       = false;
+    uint16_t bestCurrent = adaptiveCurrent;
+    float    bestScore   = 0.0f;
 
-    for (int ci = 0; ci <= startCurrentIdx && !g_tuneAbortReq; ci++) {
-        uint16_t mA = AT_CURRENTS[ci];
+    auto validateCurrent = [&](int ci, const char *label, SessionStats &s, float &score) -> bool {
+        uint16_t mA = currentForIndex(ci);
         applyTuneCurrentMa(mA);
         g_overrideDecel = safeDecel;
         setTuneLiveSettings(safeSpeedAxis, safeSpeedDiag, safeAccel, safeDecel);
-        atLog("Current level %d/%d: %u mA", ci + 1, numCurrents, (unsigned)mA);
+        atLog("%s: %u mA", label, (unsigned)mA);
         vTaskDelay(250 / portTICK_PERIOD_MS);  // let drivers settle
 
-        SessionStats s;
         if (!runTrajectorySession(/*quick=*/true, /*axisOnly=*/false,
                                    safeSpeedAxis, safeSpeedDiag, safeAccel, refYMin, refXMin, s)) {
             g_overrideDecel = 0.0f;
-            return lastGoodCurrent;
+            return false;
         }
 
-        float score   = computeLevelScore(s);
-        bool  hardFail = (s.timeouts > 0) || (!s.driftOk) || (s.driftExceeded > 0);
+        score = computeLevelScore(s);
+        bool hardFail = (s.timeouts > 0) || (!s.driftOk) || (s.driftExceeded > 0);
         bool  levelOk = !hardFail && (score >= AT_SCORE_PASS_THRESHOLD);
         atLog("Current %u mA: score=%.2f %s (drift=%.1f Y:%.1f X:%.1f refFails=%u timeouts=%u)",
               (unsigned)mA, score, levelOk ? "PASS" : "FAIL",
@@ -1410,22 +1680,44 @@ static uint16_t phaseCurrentTune(long &refYMin, long &refXMin,
                           (unsigned)s.catDriftChecks[c],
                           CAT_WEIGHT[c]);
             }
-            continue;
         }
-        lastGoodCurrent = mA;
-        lastGoodScore   = score;
-        foundPass = true;
-        setPhaseProgress(AT_PHASE_CURRENT, (int)(100.0f * (ci + 1) / numCurrents));
-        break;
+        return levelOk;
+    };
+
+    SessionStats s;
+    float score = 0.0f;
+    if (!validateCurrent(startCurrentIdx, "Adaptive current validation", s, score)) {
+        g_overrideDecel = 0.0f;
+        atLog("Adaptive current did not revalidate cleanly; keeping %u mA with final stabilisation fallback",
+              (unsigned)adaptiveCurrent);
+        setPhaseProgress(AT_PHASE_CURRENT, 100);
+        return adaptiveCurrent;
+    }
+
+    bestScore = score;
+    setPhaseProgress(AT_PHASE_CURRENT, 70);
+
+    // Efficiency trim: only try one step lower.  Older code swept from the
+    // lowest current upward, which was slow and often caused avoidable
+    // recovery cycles before reaching the already-known working current.
+    if (startCurrentIdx > 0 && !g_tuneAbortReq) {
+        int lowerIdx = startCurrentIdx - 1;
+        SessionStats lowStats;
+        float lowScore = 0.0f;
+        if (validateCurrent(lowerIdx, "One-step lower current check", lowStats, lowScore)) {
+            bestCurrent = currentForIndex(lowerIdx);
+            bestScore   = lowScore;
+            atLog("Current trim accepted: %u mA", (unsigned)bestCurrent);
+        } else {
+            atLog("Current trim rejected; keeping adaptive current %u mA",
+                  (unsigned)adaptiveCurrent);
+        }
     }
 
     g_overrideDecel = 0.0f;
-    if (!foundPass) {
-        atLog("Current sweep: no lower current passed, keeping adaptive current %u mA",
-              (unsigned)lastGoodCurrent);
-    }
-    atLog("Current sweep done: safe=%u mA (score=%.2f)", (unsigned)lastGoodCurrent, lastGoodScore);
-    return lastGoodCurrent;
+    setPhaseProgress(AT_PHASE_CURRENT, 100);
+    atLog("Current validation done: safe=%u mA (score=%.2f)", (unsigned)bestCurrent, bestScore);
+    return bestCurrent;
 }
 
 // ---- Phase 6: Final characterisation at tuned params (quick suite) ----
@@ -1528,8 +1820,12 @@ static bool stabilizeFinalSettings(long &refYMin, long &refXMin,
     // Step 1: Try at current (tuned) settings
     if (phaseFinalCharacterize(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
                                safeDecel, safeCurrent)) {
-        reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
-                           safeDecel, safeCurrent);
+        if (AT_ENABLE_SPEED_RECLAIM) {
+            reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
+                               safeDecel, safeCurrent);
+        } else {
+            atLog("Speed reclaim skipped for fast/seamless tune.");
+        }
         return true;
     }
 
@@ -1540,8 +1836,12 @@ static bool stabilizeFinalSettings(long &refYMin, long &refXMin,
         safeCurrent = maxSafeCurrent;
         if (phaseFinalCharacterize(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
                                    safeDecel, safeCurrent)) {
-            reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
-                               safeDecel, safeCurrent);
+            if (AT_ENABLE_SPEED_RECLAIM) {
+                reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
+                                   safeDecel, safeCurrent);
+            } else {
+                atLog("Speed reclaim skipped for fast/seamless tune.");
+            }
             return true;
         }
     }
@@ -1562,8 +1862,12 @@ static bool stabilizeFinalSettings(long &refYMin, long &refXMin,
                                    safeDecel, safeCurrent)) {
             atLog("Stabilisation: stable at %.0f%% of tuned speed (axis=%.0f diag=%.0f)",
                   ratio * 100.0f, safeSpeedAxis, safeSpeedDiag);
-            reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
-                               safeDecel, safeCurrent);
+            if (AT_ENABLE_SPEED_RECLAIM) {
+                reclaimFinalSpeeds(refYMin, refXMin, safeSpeedAxis, safeSpeedDiag, safeAccel,
+                                   safeDecel, safeCurrent);
+            } else {
+                atLog("Speed reclaim skipped for fast/seamless tune.");
+            }
             return true;
         }
     }
@@ -1571,6 +1875,74 @@ static bool stabilizeFinalSettings(long &refYMin, long &refXMin,
     // Nothing passed even at 50% — caller will save the 50% floor as a last resort
     atLog("Stabilisation: no stable configuration found down to 50%% of tuned speed");
     return false;
+}
+
+static float phaseCalibrationSpeedTune(long refYMin, long refXMin, float safeSpeedAxis) {
+    static const float CANDIDATES[] = {1200.f, 1800.f, 2400.f, 3000.f, 3600.f, 4200.f};
+    static const uint8_t N_CANDIDATES = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
+    const float cap = clampf(safeSpeedAxis * 0.45f, 1200.0f, 4200.0f);
+    const float driftLimit = fminf(AT_MAX_DRIFT_STEPS * 0.60f, 30.0f);
+
+    atLog("=== Phase: Calibration Speed Tune ===");
+    atLog("Calibration seek candidates capped at %.0f steps/s, drift limit %.1f steps",
+          cap, driftLimit);
+
+    float lastGood = 1200.0f;
+    float lastDrift = 0.0f;
+
+    for (uint8_t i = 0; i < N_CANDIDATES && !g_tuneAbortReq; i++) {
+        const float spd = CANDIDATES[i];
+        if (spd > cap + 1.0f) break;
+
+        bool ok = true;
+        float maxDrift = 0.0f;
+
+        for (uint8_t rep = 0; rep < 2 && ok && !g_tuneAbortReq; rep++) {
+            long hitY, hitX;
+            if (!guardedSeekHallMin('Y', hitY, spd)) {
+                ok = false;
+                break;
+            }
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            if (!guardedSeekHallMin('X', hitX, spd)) {
+                ok = false;
+                break;
+            }
+
+            const float dY = (float)(hitY - refYMin);
+            const float dX = (float)(hitX - refXMin);
+            const float mag = sqrtf(dX * dX + dY * dY);
+            if (mag > maxDrift) maxDrift = mag;
+
+            setRawABfromXY(refXMin, refYMin);
+
+            long cx, cy;
+            portENTER_CRITICAL(&gMux);
+            cx = g_xCenterTarget;
+            cy = g_yCenterTarget;
+            portEXIT_CRITICAL(&gMux);
+            tuneMoveToPath(cx, cy, 18000UL);
+
+            atLog("Calib speed %.0f rep %u: Y=%ld dY=%.1f X=%ld dX=%.1f |%.1f|",
+                  spd, (unsigned)(rep + 1), hitY, dY, hitX, dX, mag);
+
+            if (mag > driftLimit) ok = false;
+            vTaskDelay(60 / portTICK_PERIOD_MS);
+        }
+
+        atLog("Calibration speed %.0f: %s maxDrift=%.1f",
+              spd, ok ? "PASS" : "FAIL", maxDrift);
+
+        if (!ok) break;
+        lastGood = spd;
+        lastDrift = maxDrift;
+    }
+
+    float safe = lastGood * 0.90f;
+    if (safe < 1200.0f) safe = 1200.0f;
+    atLog("Calibration speed done: lastGood=%.0f maxDrift=%.1f safe=%.0f",
+          lastGood, lastDrift, safe);
+    return safe;
 }
 
 // ============================================================
@@ -1606,6 +1978,8 @@ static bool runTuneSequence() {
     if (g_tuneAbortReq) return false;
 
     int currentIdx = 0;
+    s_prevSpreadCycle = getDriversSpreadCycle();
+    setDriversSpreadCycle(AT_USE_SPREADCYCLE);
     setMotionProfileLock(true, AT_LOCKED_MICROSTEPS, currentForIndex(currentIdx));
     applyTuneCurrent(currentIdx);
     setTuneLiveSettings(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1638,7 +2012,7 @@ static bool runTuneSequence() {
         const float speedAxisHigh  = safeSpeedAxis;
         const int   currentIdxHigh = currentIdx;
 
-        if (currentIdxHigh > 0 && !g_tuneAbortReq) {
+        if (AT_ENABLE_EFFICIENCY_CHECK && currentIdxHigh > 0 && !g_tuneAbortReq) {
             const int capIdx = currentIdxHigh - 1;
             int currentIdxLow = 0;
 
@@ -1691,6 +2065,8 @@ static bool runTuneSequence() {
                 refXMin = g_xHardMin;
                 portEXIT_CRITICAL(&gMux);
             }
+        } else if (!AT_ENABLE_EFFICIENCY_CHECK) {
+            atLog("Efficiency re-run skipped for fast/seamless tune.");
         }
     }
     if (g_tuneAbortReq) return false;
@@ -1724,12 +2100,16 @@ static bool runTuneSequence() {
         atLog("  Saving conservative floor settings (axis=%.0f diag=%.0f current=%u)",
               safeSpeedAxis, safeSpeedDiag, (unsigned)safeCurrent);
     }
+
+    float safeCalibSpeed = phaseCalibrationSpeedTune(refYMin, refXMin, safeSpeedAxis);
+    if (g_tuneAbortReq) return false;
     setPhaseProgress(AT_PHASE_APPROACH, 100);
 
     // ---- Apply and persist results ----
 
     g_tuneSettings.safeSpeed     = safeSpeedAxis;
     g_tuneSettings.safeSpeedDiag = safeSpeedDiag;
+    g_tuneSettings.calibSpeed    = safeCalibSpeed;
     g_tuneSettings.safeAccel     = 0.0f;  // not tuned; firmware ramp constants apply
     g_tuneSettings.safeDecel     = 0.0f;  // not tuned; firmware ramp constants apply
     g_tuneSettings.motorCurrent  = safeCurrent;
@@ -1738,6 +2118,8 @@ static bool runTuneSequence() {
 
     g_overrideVmax     = safeSpeedAxis;
     g_overrideDiagVmax = safeSpeedDiag;
+    g_calibYSpeed      = safeCalibSpeed;
+    g_calibXSpeed      = safeCalibSpeed;
     // g_overrideAccel and g_overrideDecel left at 0 — hardware constants used
     setMotionProfileLock(true, AT_LOCKED_MICROSTEPS, safeCurrent);
     applyTuneCurrentMa(safeCurrent);
@@ -1746,6 +2128,7 @@ static bool runTuneSequence() {
     atLog("=== AutoTune COMPLETE ===");
     atLog("  axisSpeed  = %.0f steps/s", safeSpeedAxis);
     atLog("  diagSpeed  = %.0f steps/s", safeSpeedDiag);
+    atLog("  calibSpeed = %.0f steps/s", safeCalibSpeed);
     atLog("  safeAccel  = %.0f steps/s²", safeAccel);
     atLog("  safeDecel  = %.0f steps/s²", safeDecel);
     atLog("  current    = %u mA", (unsigned)safeCurrent);
@@ -1760,16 +2143,19 @@ static bool runTuneSequence() {
 static void autoTuneTaskFn(void *param) {
     (void)param;
     atLog("AutoTune task started");
+    atLog("AutoTune build: guarded-ref v2026-07-04j");
     g_systemState = SYS_TUNING;
 
     bool ok = runTuneSequence();
 
     if (!ok || g_tuneAbortReq) {
         atEmergencyStop("tune end");
+        setDriversSpreadCycle(s_prevSpreadCycle);
         setPhaseProgress(g_tuneAbortReq ? AT_PHASE_ABORTED : AT_PHASE_ERROR, 0);
         g_systemState = g_tuneAbortReq ? SYS_READY : SYS_ERROR;
         atLog(g_tuneAbortReq ? "AutoTune ABORTED by user" : "AutoTune ERROR");
     } else {
+        setDriversSpreadCycle(AT_USE_SPREADCYCLE);
         g_systemState = SYS_READY;
     }
 
@@ -1801,19 +2187,33 @@ void autoTuneInit()  {
 bool autoTuneStart() {
     if (g_tuneActive) {
         Serial.println("[AT] Already running.");
+        atLog("Cannot start: AutoTune is already running.");
         return false;
     }
     bool calOk;
+    CalibState cs;
+    SystemState sys;
     portENTER_CRITICAL(&gMux);
     calOk = g_yLimitsCalibrated && g_xLimitsCalibrated;
+    cs = g_calibState;
+    sys = g_systemState;
     portEXIT_CRITICAL(&gMux);
     if (!calOk) {
         Serial.println("[AT] Cannot start: no valid calibration.");
+        atLog("Cannot start: no valid calibration. Run board calibration first.");
         return false;
     }
-    if (g_calibState != CALIB_IDLE) {
+    if (cs != CALIB_IDLE) {
         Serial.println("[AT] Cannot start: calibration in progress.");
+        atLog("Cannot start: calibration is still active (state=%u).", (unsigned)cs);
         return false;
+    }
+
+    if (sys == SYS_ERROR) {
+        portENTER_CRITICAL(&gMux);
+        g_systemState = SYS_READY;
+        portEXIT_CRITICAL(&gMux);
+        atLog("Previous error cleared; starting AutoTune.");
     }
 
     g_tuneActive    = true;

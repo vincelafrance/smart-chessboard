@@ -107,6 +107,33 @@ void getXYfromAB_raw(long aPos, long bPos, long &xAbs, long &yAbs) {
   yAbs = XY_ORIGIN_Y + dy;
 }
 
+void setRawABfromXY(long xAbs, long yAbs) {
+  long dx = xAbs - XY_ORIGIN_X;
+  long dy = yAbs - XY_ORIGIN_Y;
+
+  if (INVERT_X) dx = -dx;
+  if (INVERT_Y) dy = -dy;
+
+  long aPos = dx + dy;
+  long bPos = dx - dy;
+
+  if (SWAP_MOTORS_AB) { long t = aPos; aPos = bPos; bPos = t; }
+
+  uint8_t ms = getDriversUARTMicrosteps();
+  if (ms != 0 && ms != 8) {
+    const float scaleToRaw = (float)ms / 8.0f;
+    aPos = (long)lroundf((float)aPos * scaleToRaw);
+    bPos = (long)lroundf((float)bPos * scaleToRaw);
+  }
+
+  portENTER_CRITICAL(&gMux);
+  g_Apos = aPos;
+  g_Bpos = bPos;
+  g_xAbs = xAbs;
+  g_yAbs = yAbs;
+  portEXIT_CRITICAL(&gMux);
+}
+
 uint32_t speedToPeriodUs(float vStepsPerSec) {
   float av = fabsf(vStepsPerSec);
   if (av < 1.0f) return 0;
